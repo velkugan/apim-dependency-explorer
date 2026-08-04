@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>APIM Dependency Explorer</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="wordmark">APIM<span class="tick"></span>DEPENDENCIES</div>
+      <button id="toggle-setup" class="ghost" type="button" title="Show or hide connection settings">Connection</button>
+    </header>
+
+    <section id="setup" class="setup">
+      <div class="field">
+        <label for="token">Bearer token</label>
+        <textarea id="token" rows="3" spellcheck="false"
+          placeholder="Paste the ARM access token (the part after &quot;Bearer &quot;)"></textarea>
+        <div class="row">
+          <label class="check">
+            <input type="checkbox" id="capture" />
+            Capture token from Azure portal traffic
+          </label>
+          <button id="use-captured" class="ghost small" type="button" disabled>Use captured</button>
+        </div>
+        <p id="token-status" class="status"></p>
+      </div>
+
+      <div class="field">
+        <label for="service">API Management instance</label>
+        <input id="service" type="text" spellcheck="false"
+          placeholder="Resource ID, portal URL, or subscription/resourceGroup/serviceName" />
+        <div class="row">
+          <select id="api-version" title="ARM API version"></select>
+          <button id="discover" class="ghost small" type="button">Find services</button>
+        </div>
+        <div id="discovered" class="discovered"></div>
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input type="checkbox" id="compare-enabled" />
+          Compare against a target instance
+        </label>
+        <div id="compare-fields" hidden>
+          <input id="target-service" type="text" spellcheck="false"
+            placeholder="Target resource ID, portal URL, or subscription/resourceGroup/serviceName" />
+          <div class="row">
+            <input id="env-pattern" type="text" spellcheck="false"
+              placeholder="Environment tokens to ignore when matching names" />
+          </div>
+          <p id="target-status" class="status"></p>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input type="checkbox" id="include-operations" checked />
+          Read operation-level policies on expand
+        </label>
+        <label class="check">
+          <input type="checkbox" id="include-products" checked />
+          Read product policies on expand
+        </label>
+      </div>
+
+      <div class="row actions">
+        <button id="fetch" class="primary" type="button">Fetch APIs</button>
+        <button id="clear-cache" class="ghost small" type="button">Clear cache</button>
+      </div>
+      <p id="setup-error" class="error" hidden></p>
+    </section>
+
+    <section class="toolbar" id="toolbar" hidden>
+      <input id="search" type="search" placeholder="Filter APIs" spellcheck="false" />
+      <button id="export" class="ghost small" type="button" title="Download everything resolved so far">Export</button>
+    </section>
+
+    <main id="results" class="results">
+      <p class="empty">Paste a token, point at an API Management instance, then fetch. Dependencies load per API, only when you expand one.</p>
+    </main>
+
+    <footer class="statusbar">
+      <span id="progress"></span>
+      <span id="counters"></span>
+    </footer>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

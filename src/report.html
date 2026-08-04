@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>APIM dependencies</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+    <link rel="stylesheet" href="report.css" />
+  </head>
+  <body class="report-body">
+    <header class="report-head">
+      <div class="head-left">
+        <div class="wordmark">APIM<span class="tick"></span>DEPENDENCIES</div>
+        <select id="api-picker" title="Switch API"></select>
+      </div>
+      <div class="head-right">
+        <input id="filter" type="search" placeholder="Filter across all categories" spellcheck="false" />
+        <button id="copy-list" class="ghost small" type="button">Copy list</button>
+        <button id="copy-json" class="ghost small" type="button">Copy JSON</button>
+        <button id="copy-gaps" class="ghost small" type="button" hidden>Copy gaps</button>
+        <button id="print" class="ghost small" type="button">Print</button>
+      </div>
+    </header>
+
+    <div class="report-title">
+      <h1 id="api-title">—</h1>
+      <p id="api-meta" class="api-meta"></p>
+    </div>
+
+    <div class="report-layout">
+      <nav id="nav" class="report-nav"></nav>
+      <main id="main" class="report-main"></main>
+    </div>
+
+    <script type="module" src="report.js"></script>
+  </body>
+</html>

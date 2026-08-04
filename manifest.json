@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "APIM Dependency Explorer",
+  "version": "0.1.1",
+  "description": "Lists Azure API Management APIs and lazily resolves each API's backends, products, policy fragments, named values and Key Vault links.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "https://management.azure.com/*",
+    "https://portal.azure.com/*",
+    "https://*.portal.azure.com/*",
+    "https://*.portal.azure.net/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel.html"
+  },
+  "action": {
+    "default_title": "APIM Dependency Explorer"
+  }
+}

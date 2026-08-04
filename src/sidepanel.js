@@ -26,6 +26,7 @@ const state = {
   apis: [],
   catalog: null,
   resolved: new Map(),
+  lastExpanded: null,
   targetService: null,
   targetIndex: null,
   inFlight: new Set(),
@@ -346,6 +347,53 @@ for (const field of [els.targetService, els.envPattern]) {
   });
 }
 
+// Discovery for the target field, mirroring the source instance picker.
+const targetDiscovered = h('div', { class: 'discovered' });
+const targetDiscoverButton = h(
+  'button',
+  {
+    class: 'ghost small',
+    type: 'button',
+    onClick: async () => {
+      targetDiscovered.replaceChildren(h('div', { class: 'loading' }, 'Listing subscriptions'));
+      try {
+        const services = await discoverServices(client, els.apiVersion.value);
+        if (!services.length) {
+          targetDiscovered.replaceChildren(
+            h('div', { class: 'note' }, 'No API Management instances visible to this token.')
+          );
+          return;
+        }
+        targetDiscovered.replaceChildren(
+          ...services.map((svc) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                onClick: () => {
+                  els.targetService.value = svc.id;
+                  targetDiscovered.replaceChildren();
+                  state.targetIndex = null;
+                  state.targetService = null;
+                  for (const resolved of state.resolved.values()) resolved.comparison = null;
+                  saveSettings();
+                  render();
+                }
+              },
+              `${svc.serviceName} · ${svc.resourceGroup} · ${svc.location}`
+            )
+          )
+        );
+      } catch (err) {
+        targetDiscovered.replaceChildren(h('div', { class: 'note' }, err.message));
+      }
+    }
+  },
+  'Find target'
+);
+els.envPattern.parentElement.append(targetDiscoverButton);
+els.targetStatus.before(targetDiscovered);
+
 /** Builds the target index once, then reuses it for every API compared. */
 async function ensureTargetIndex(onProgress) {
   if (!els.compareEnabled.checked) return null;
@@ -491,6 +539,7 @@ function renderApiRow(api) {
 
   details.addEventListener('toggle', () => {
     if (!details.open) return;
+    state.lastExpanded = apiId;
     if (state.resolved.has(apiId) || state.inFlight.has(apiId)) return;
     expandApi(api, body, summary);
   });
@@ -499,37 +548,48 @@ function renderApiRow(api) {
 }
 
 function fingerprint(resolved) {
-  const bars = [
-    ['backends', 'var(--c-backend)'],
-    ['products', 'var(--c-product)'],
-    ['fragments', 'var(--c-fragment)'],
-    ['namedValues', 'var(--c-namedvalue)'],
-    ['keyVault', 'var(--c-vault)']
+  // Letters beat bar heights here: a bar only says one thing is bigger than
+  // another, a chip says what it is and how many.
+  const chips = [
+    ['BE', 'backends', 'var(--c-backend)', 'backends'],
+    ['PR', 'products', 'var(--c-product)', 'products'],
+    ['FR', 'fragments', 'var(--c-fragment)', 'policy fragments'],
+    ['NV', 'namedValues', 'var(--c-namedvalue)', 'named values'],
+    ['KV', 'keyVault', 'var(--c-vault)', 'Key Vault secrets']
   ];
   const wrap = h('span', { class: 'fingerprint' });
-  for (const [key, color] of bars) {
+
+  for (const [label, key, color, title] of chips) {
     const n = resolved.counts[key] || 0;
-    add(wrap, 
-      h('i', {
-        style: `height:${Math.min(12, 2 + n * 2)}px;background:${n ? color : 'var(--line)'}`,
-        title: `${n} ${key}`
-      })
+    if (!n) continue;
+    add(wrap, h('span', { class: 'fp', style: `color:${color}`, title: `${n} ${title}` }, `${label}${n}`));
+  }
+
+  if (resolved.counts.issues) {
+    add(
+      wrap,
+      h(
+        'span',
+        { class: 'fp', style: 'color:var(--c-issue)', title: `${resolved.counts.issues} broken reference(s)` },
+        `!${resolved.counts.issues}`
+      )
     );
   }
-  if (resolved.counts.issues) {
-    add(wrap, h('span', { class: 'n', style: 'color:var(--c-issue)' }, `${resolved.counts.issues}!`));
-  }
+
   if (resolved.comparison) {
     const blocking = resolved.comparison.blocking;
-    add(wrap, 
+    add(
+      wrap,
       h(
         'span',
         {
-          class: 'n',
+          class: 'fp',
           style: `color:${blocking ? 'var(--c-issue)' : 'var(--c-namedvalue)'}`,
-          title: `target ${resolved.comparison.target}`
+          title: blocking
+            ? `${blocking} gap(s) against ${resolved.comparison.target}`
+            : `matches ${resolved.comparison.target}`
         },
-        blocking ? `▲${blocking}` : '✓'
+        blocking ? `GAP${blocking}` : 'OK'
       )
     );
   }
@@ -572,6 +632,7 @@ async function expandApi(api, body, summary) {
     }
 
     state.resolved.set(apiId, resolved);
+    state.lastExpanded = apiId;
     body.replaceChildren(renderResolved(resolved));
     const old = summary.querySelector('.fingerprint, .api-meta:last-child');
     if (old) old.replaceWith(fingerprint(resolved));
@@ -652,7 +713,11 @@ function toText(r) {
 
   section(
     'BACKENDS',
-    r.backends.map((b) => `${b.id}${b.url ? `  ${b.url}` : ''}${b.exists ? '' : '  [MISSING]'}`)
+    r.backends.map((b) =>
+      b.dynamic
+        ? `${b.id}  [DYNAMIC -> ${b.candidates?.map((c) => c.id).join(', ') || 'no match'}]`
+        : `${b.id}${b.url ? `  ${b.url}` : ''}${b.exists ? '' : '  [MISSING]'}`
+    )
   );
   section(
     'PRODUCTS',
@@ -938,7 +1003,7 @@ function renderResolved(r) {
           class: 'link',
           type: 'button',
           style: 'margin-left:12px',
-          onClick: () => openReport([r])
+          onClick: () => openReport([...state.resolved.values()], r.apiId)
         },
         'Open report'
       )
@@ -960,7 +1025,18 @@ function renderResolved(r) {
       'g-backend',
       r.backends.length,
       r.backends.map((b) =>
-        item(b.id, {
+        b.dynamic
+          ? item(b.id, {
+              missing: !b.exists,
+              pill: 'dynamic',
+              pillColor: 'var(--c-product)',
+              sub: b.candidates?.length
+                ? `${b.candidates.length} possible: ${b.candidates.map((c) => c.id).join(', ')}`
+                : 'built at runtime, no matching backend found',
+              why: b.resolvedVia,
+              refs: b.usedIn
+            })
+          : item(b.id, {
           missing: !b.exists,
           sub: b.url || (b.exists ? b.resourceId : 'not defined on this instance'),
           why: [
@@ -1223,7 +1299,7 @@ function renderResolved(r) {
  * The report goes to a detached window that can lay the categories out in
  * columns. The payload rides in session storage rather than the URL.
  */
-async function openReport(resolvedList) {
+async function openReport(resolvedList, focusApiId = null) {
   if (!resolvedList.length) {
     setProgress('Expand an API first');
     return;
@@ -1233,6 +1309,8 @@ async function openReport(resolvedList) {
     service: state.service?.ref || null,
     target: state.targetIndex?.ref || null,
     generatedAt: new Date().toISOString(),
+    // The window opens on the API you asked for, not whichever resolved first.
+    focus: focusApiId,
     apis: resolvedList.map(toReport)
   };
 
@@ -1243,11 +1321,17 @@ async function openReport(resolvedList) {
     if (stale.length) await chrome.storage.session.remove(stale);
 
     await chrome.storage.session.set({ [key]: payload });
+    // Fit the display rather than assuming one: a fixed 1180 runs off the edge
+    // of a smaller screen and gets clipped.
+    const width = Math.max(900, Math.min(1600, (screen.availWidth || 1440) - 120));
+    const height = Math.max(600, Math.min(1050, (screen.availHeight || 900) - 80));
     await chrome.windows.create({
       url: chrome.runtime.getURL(`src/report.html?key=${encodeURIComponent(key)}`),
       type: 'popup',
-      width: 1180,
-      height: 900
+      width,
+      height,
+      left: 40,
+      top: 30
     });
   } catch (err) {
     setProgress(`Could not open the report: ${err.message}`);
@@ -1260,7 +1344,8 @@ const reportAllButton = h(
     class: 'ghost small',
     type: 'button',
     title: 'Open every resolved API in a report window',
-    onClick: () => openReport([...state.resolved.values()])
+    onClick: () =>
+      openReport([...state.resolved.values()], state.lastExpanded || null)
   },
   'Report'
 );

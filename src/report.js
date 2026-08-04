@@ -35,11 +35,25 @@ async function boot() {
   state.payload = payload;
   document.title = `${payload.service?.serviceName || 'APIM'} dependencies`;
 
-  for (const [index, api] of payload.apis.entries()) {
-    els.picker.append(h('option', { value: String(index) }, api.apiLabel));
+  // Resolve the focus before building the picker, so the option can be marked
+  // selected as it is created rather than assigned to afterwards.
+  const initial = resolveFocusIndex(payload);
+
+  const ordered = [...payload.apis.entries()].sort((a, b) =>
+    a[1].apiLabel.localeCompare(b[1].apiLabel)
+  );
+  for (const [index, api] of ordered) {
+    els.picker.append(
+      h('option', { value: String(index), selected: index === initial }, api.apiLabel)
+    );
   }
   els.picker.hidden = payload.apis.length < 2;
   els.picker.addEventListener('change', () => show(payload.apis[Number(els.picker.value)]));
+
+  // Belt and braces: setting selectedIndex directly survives any option the
+  // browser may have auto-selected first.
+  const option = [...els.picker.options].findIndex((o) => Number(o.value) === initial);
+  if (option >= 0) els.picker.selectedIndex = option;
 
   els.filter.addEventListener('input', applyFilter);
   els.print.addEventListener('click', () => window.print());
@@ -51,7 +65,36 @@ async function boot() {
     copyWith(els.copyGaps, () => comparisonToText(state.current.comparison, state.current.apiLabel))
   );
 
-  show(payload.apis[0]);
+  els.viewToggle = h(
+    'button',
+    { class: 'ghost small', type: 'button', onClick: toggleView },
+    'Tree view'
+  );
+  els.copyList.before(els.viewToggle);
+
+  show(payload.apis[initial]);
+}
+
+/**
+ * Which API the window should open on. Matches on id, then case-insensitively,
+ * then on label, and falls back to the first API in the payload rather than the
+ * alphabetically first, so the fallback is at least predictable.
+ */
+function resolveFocusIndex(payload) {
+  const focus = payload.focus;
+  if (!focus) return 0;
+
+  const exact = payload.apis.findIndex((a) => a.apiId === focus);
+  if (exact >= 0) return exact;
+
+  const lower = String(focus).toLowerCase();
+  const loose = payload.apis.findIndex(
+    (a) => String(a.apiId).toLowerCase() === lower || String(a.apiLabel).toLowerCase() === lower
+  );
+  if (loose >= 0) return loose;
+
+  console.warn('APIM report: focus %o did not match any API in the payload', focus);
+  return 0;
 }
 
 function fail(message) {
@@ -100,6 +143,7 @@ function row(name, opts = {}) {
 }
 
 const cards = [];
+const ROW_LIMIT = 12;
 
 function card(id, title, stemClass, rows, opts = {}) {
   if (!rows || !rows.length) {
@@ -122,11 +166,34 @@ function card(id, title, stemClass, rows, opts = {}) {
     },
     'copy'
   );
+  const rowsWrap = h('div', { class: 'rows' }, ...rows);
   node.append(
     h('header', null, h('h2', null, title), h('span', { class: 'count' }, rows.length), button),
     ...(opts.note ? [h('p', { class: 'card-note' }, opts.note)] : []),
-    h('div', { class: 'rows' }, ...rows)
+    rowsWrap
   );
+
+  // A 47-row card buries everything under it. Show a readable slice, keep the
+  // rest one click away, and let the filter reveal all of it.
+  const limit = opts.limit ?? ROW_LIMIT;
+  if (rows.length > limit) {
+    rowsWrap.classList.add('collapsed');
+    for (const extra of rows.slice(limit)) extra.classList.add('extra');
+    const more = h(
+      'button',
+      {
+        class: 'show-more',
+        type: 'button',
+        onClick: () => {
+          const collapsed = rowsWrap.classList.toggle('collapsed');
+          more.textContent = collapsed ? `Show all ${rows.length}` : 'Show fewer';
+        }
+      },
+      `Show all ${rows.length}`
+    );
+    node.append(more);
+  }
+
   cards.push({ id, title, count: rows.length, node, stemClass });
   return node;
 }
@@ -160,7 +227,18 @@ function show(api) {
       'Backends',
       'g-backend',
       api.backends.map((b) =>
-        row(b.id, {
+        b.dynamic
+          ? row(b.id, {
+              missing: !b.exists,
+              pill: 'dynamic',
+              pillColor: 'var(--c-product)',
+              sub: b.candidates?.length
+                ? b.candidates.map((c) => `${c.id}${c.url ? ` → ${c.url}` : ''}`).join('\n')
+                : 'built at runtime, no matching backend found',
+              why: `${b.resolvedVia} · any of these can be selected at runtime`,
+              refs: b.usedIn
+            })
+          : row(b.id, {
           missing: !b.exists,
           sub: b.url || (b.exists ? b.resourceId : 'not defined on this instance'),
           why: [
@@ -306,7 +384,10 @@ function show(api) {
           refs: [...v.written, ...v.read]
         })
       ),
-      { note: 'Runtime state, not configuration. Listed separately so it is never counted as a dependency.' }
+      {
+        limit: 8,
+        note: 'Runtime state, not configuration. Listed separately so it is never counted as a dependency.'
+      }
     ),
     card(
       'excluded',
@@ -362,7 +443,7 @@ function show(api) {
             : 'no operation policy'
         });
       }),
-      { wide: true }
+      { wide: true, limit: 40 }
     ),
     card(
       'sources',
@@ -398,7 +479,19 @@ function show(api) {
     nodes.push(node);
   }
 
-  els.main.replaceChildren(...nodes.filter(Boolean));
+  const top = h('div', { class: 'report-top' });
+  const columns = h('div', { class: 'report-columns' });
+  const wide = h('div', { class: 'report-wide' });
+  for (const node of nodes.filter(Boolean)) {
+    if (node.id === 'gaps') top.append(node);
+    else if (node.classList.contains('wide')) wide.append(node);
+    else columns.append(node);
+  }
+  els.main.replaceChildren(top, columns, wide);
+  if (document.body.classList.contains('tree-mode')) {
+    els.main.append(h('div', { id: 'tree-root', class: 'tree-root' }, buildTree(api)));
+  }
+
   renderNav();
   applyFilter();
 }
@@ -513,6 +606,158 @@ function gapCard(comparison) {
   return node;
 }
 
+// ---------------------------------------------------------------------------
+// tree view
+// ---------------------------------------------------------------------------
+
+const KIND_CLASS = {
+  backend: 'g-backend',
+  product: 'g-product',
+  fragment: 'g-fragment',
+  'named value': 'g-namedvalue',
+  certificate: 'g-plain',
+  logger: 'g-plain',
+  url: 'g-plain',
+  operation: 'g-plain',
+  policy: 'g-plain',
+  missing: 'g-issue'
+};
+
+function treeNode({ label, kind, detail, children, open }) {
+  const cls = KIND_CLASS[kind] || 'g-plain';
+  const head = h(
+    'span',
+    { class: 'tnode-head' },
+    h('span', { class: 'tkind' }, kind),
+    h('span', { class: 'tlabel' }, label),
+    detail ? h('span', { class: 'tdetail' }, detail) : null
+  );
+
+  if (!children || !children.length) {
+    return h('li', { class: `tnode ${cls}` }, head);
+  }
+  return h(
+    'li',
+    { class: `tnode ${cls}` },
+    h(
+      'details',
+      open ? { open: true } : null,
+      h('summary', null, head, h('span', { class: 'tcount' }, `${children.length}`)),
+      h('ul', null, ...children)
+    )
+  );
+}
+
+/**
+ * Builds the tree from the per-scope reference lists: each policy document is a
+ * branch holding only what it references directly, and a fragment branch expands
+ * into that fragment's own document.
+ */
+function buildTree(api) {
+  const scopes = api.scopes || [];
+  const scopeByFragment = new Map();
+  for (const scope of scopes) {
+    if (scope.type === 'fragment') {
+      const id = scope.scope.replace(/^fragment:/, '');
+      scopeByFragment.set(id.toLowerCase(), scope);
+    }
+  }
+  const fragmentMeta = new Map((api.fragments || []).map((f) => [f.id.toLowerCase(), f]));
+  const backendMeta = new Map((api.backends || []).map((b) => [String(b.id).toLowerCase(), b]));
+  const nvMeta = new Map((api.namedValues || []).map((n) => [n.token.toLowerCase(), n]));
+
+  const leaves = (scope, seen) => {
+    const out = [];
+    for (const id of scope.fragments) {
+      const key = id.toLowerCase();
+      const meta = fragmentMeta.get(key);
+      if (seen.has(key)) {
+        out.push(treeNode({ label: id, kind: 'fragment', detail: 'already expanded above' }));
+        continue;
+      }
+      const child = scopeByFragment.get(key);
+      const nextSeen = new Set(seen).add(key);
+      out.push(
+        treeNode({
+          label: id,
+          kind: meta && !meta.exists ? 'missing' : 'fragment',
+          detail: meta?.exists === false ? 'not defined' : meta?.description || null,
+          children: child ? leaves(child, nextSeen) : []
+        })
+      );
+    }
+    for (const entry of scope.backendEntries || scope.backends.map((k) => ({ key: k }))) {
+      const meta = backendMeta.get(String(entry.raw || entry.key).toLowerCase());
+      out.push(
+        treeNode({
+          label: entry.raw || entry.key,
+          kind: meta && !meta.exists ? 'missing' : 'backend',
+          detail: meta?.dynamic
+            ? `dynamic → ${meta.candidates?.map((c) => c.id).join(', ') || 'no match'}`
+            : meta?.url || null
+        })
+      );
+    }
+    for (const token of scope.namedValues) {
+      const meta = nvMeta.get(token.toLowerCase());
+      out.push(
+        treeNode({
+          label: token,
+          kind: meta && !meta.exists ? 'missing' : 'named value',
+          detail: meta?.keyVault
+            ? `key vault ${meta.keyVault.vaultName}/${meta.keyVault.secretName}`
+            : meta?.secret
+            ? 'secret'
+            : meta?.value ?? null
+        })
+      );
+    }
+    for (const id of scope.certificates) out.push(treeNode({ label: id, kind: 'certificate' }));
+    for (const id of scope.loggers) out.push(treeNode({ label: id, kind: 'logger' }));
+    for (const url of scope.urls) out.push(treeNode({ label: url, kind: 'url' }));
+    for (const name of scope.unresolved) {
+      out.push(treeNode({ label: `{{${name}}}`, kind: 'missing', detail: 'named value not defined' }));
+    }
+    return out;
+  };
+
+  const branches = [];
+  for (const scope of scopes) {
+    if (scope.type === 'fragment') continue; // reached through whoever includes it
+    const children = leaves(scope, new Set());
+    if (!children.length && !scope.hasPolicy) continue;
+    branches.push(
+      treeNode({
+        label: scope.label,
+        kind: scope.type === 'product' ? 'product' : scope.type === 'operation' ? 'operation' : 'policy',
+        detail: scope.hasPolicy ? null : 'no policy',
+        children,
+        open: scope.type === 'api'
+      })
+    );
+  }
+
+  return h(
+    'ul',
+    { class: 'tree' },
+    treeNode({
+      label: api.apiLabel,
+      kind: 'policy',
+      detail: `/${api.path || ''}`,
+      children: branches,
+      open: true
+    })
+  );
+}
+
+function toggleView() {
+  const treeMode = document.body.classList.toggle('tree-mode');
+  els.viewToggle.textContent = treeMode ? 'Card view' : 'Tree view';
+  if (treeMode && !$('#tree-root')) {
+    els.main.append(h('div', { id: 'tree-root', class: 'tree-root' }, buildTree(state.current)));
+  }
+}
+
 function renderNav() {
   els.nav.replaceChildren(
     ...cards
@@ -532,6 +777,21 @@ function applyFilter() {
   const term = els.filter.value.trim().toLowerCase();
   for (const entry of cards) {
     if (!entry.node) continue;
+
+    // A filtered search must be able to reach rows hidden behind "show all".
+    const rowsWrap = entry.node.querySelector('.rows');
+    const more = entry.node.querySelector('.show-more');
+    if (rowsWrap?.querySelector('.extra')) {
+      if (term) {
+        rowsWrap.classList.remove('collapsed');
+        more?.classList.add('hidden-by-filter');
+      } else {
+        rowsWrap.classList.add('collapsed');
+        more?.classList.remove('hidden-by-filter');
+        if (more) more.textContent = `Show all ${rowsWrap.children.length}`;
+      }
+    }
+
     let visible = 0;
     for (const item of entry.node.querySelectorAll('.row-item')) {
       const match = !term || (item.dataset.search || '').includes(term);

@@ -200,6 +200,57 @@ function parseSecretIdentifier(secretIdentifier) {
 }
 
 /**
+ * A backend-id built at runtime selects one of several backends. Narrow the
+ * catalog by whatever is literal in the expression rather than reporting the
+ * whole string as a missing backend.
+ */
+function resolveDynamicBackend(catalog, entry) {
+  // {{some-named-value}} on its own is not really dynamic: if the named value
+  // holds a plain string, that string is the backend id.
+  if (entry.wholeToken) {
+    const nv = catalog.namedValueByToken.get(entry.wholeToken);
+    const value = nv?.properties?.secret ? null : nv?.properties?.value;
+    if (value) {
+      const direct = lookupCatalog(catalog, 'backends', value);
+      if (direct.item) {
+        return {
+          resolvedVia: `named value “${entry.wholeToken}” = ${value}`,
+          candidates: [{ name: direct.item.name, backend: direct.item }]
+        };
+      }
+    }
+  }
+
+  const prefix = (entry.prefix || '').toLowerCase();
+  const suffix = (entry.suffix || '').toLowerCase();
+  const hint = (entry.hints || [])[0]?.toLowerCase() || '';
+
+  const candidates = [];
+  for (const [name, backend] of catalog.backends) {
+    const lower = name.toLowerCase();
+    if (prefix && !lower.startsWith(prefix)) continue;
+    if (suffix && !lower.endsWith(suffix)) continue;
+    if (hint && !lower.includes(hint)) continue;
+    if (!prefix && !suffix && !hint) continue; // too vague to guess; leave empty
+    candidates.push({ name, backend });
+  }
+  candidates.sort((a, b) => a.name.localeCompare(b.name));
+
+  const describe = [
+    prefix && `prefix “${prefix}”`,
+    suffix && `suffix “${suffix}”`,
+    hint && `literal “${hint}”`
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  return {
+    resolvedVia: describe ? `matched on ${describe}` : 'no literal part to match on',
+    candidates
+  };
+}
+
+/**
  * Resolves everything one API depends on. Called only when a row is expanded.
  */
 export async function resolveApi(svc, catalog, api, opts = {}, onProgress = () => {}) {
@@ -367,10 +418,58 @@ export async function resolveApi(svc, catalog, api, opts = {}, onProgress = () =
     fragment.usedIn = merged.fragments.get(fragment.id)?.occurrences || [];
   }
 
+  // One node per policy document with only its own direct references. The tree
+  // view is built from this; the flat lists come from the merge.
+  const scopes = analyses.map((a) => ({
+    label: a.label,
+    type: a.scopeType,
+    scope: a.scope,
+    hasPolicy: a.hasPolicy,
+    namedValues: [...a.namedValues.keys()],
+    backends: [...a.backends.keys()],
+    backendEntries: [...a.backends.entries()].map(([key, value]) => ({
+      key,
+      dynamic: !!value.dynamic,
+      raw: value.raw || key
+    })),
+    fragments: [...a.fragments.keys()],
+    certificates: [...a.certificates.keys()],
+    loggers: [...a.loggers.keys()],
+    urls: [...a.urls.keys()],
+    unresolved: [...a.unresolvedNamedValues.keys()]
+  }));
+
   // --- backends -------------------------------------------------------------
   const backendNamedValues = new Set();
   const backends = [];
   for (const [id, entry] of merged.backends) {
+    if (entry.dynamic) {
+      const resolvedDynamic = resolveDynamicBackend(catalog, entry);
+      for (const candidate of resolvedDynamic.candidates) {
+        const credentials = candidate.backend?.properties?.credentials;
+        if (credentials) {
+          for (const name of namedValuesInString(JSON.stringify(credentials), catalog.knownNamedValues)) {
+            backendNamedValues.add(name);
+          }
+        }
+      }
+      backends.push({
+        id: entry.raw || id,
+        dynamic: true,
+        pattern: entry.pattern,
+        hints: entry.hints || [],
+        resolvedVia: resolvedDynamic.resolvedVia,
+        exists: resolvedDynamic.candidates.length > 0,
+        candidates: resolvedDynamic.candidates.map((c) => ({
+          id: c.name,
+          url: c.backend?.properties?.url || null,
+          title: c.backend?.properties?.title || null
+        })),
+        usedIn: entry.occurrences
+      });
+      continue;
+    }
+
     const found = lookupCatalog(catalog, 'backends', id);
     let backend = found.item;
     let confirmedByLookup = false;
@@ -599,6 +698,7 @@ export async function resolveApi(svc, catalog, api, opts = {}, onProgress = () =
     subscriptionRequired: api.properties?.subscriptionRequired,
     protocols: api.properties?.protocols || [],
     inheritsGlobal,
+    scopes,
     allOperations,
     sourcesRead,
     catalogSummary: {
@@ -671,6 +771,7 @@ export function toReport(r) {
     counts: r.counts,
     catalogSummary: r.catalogSummary,
     sourcesRead: r.sourcesRead,
+    scopes: r.scopes,
     backends: r.backends,
     products: r.products.map((p) => ({
       id: p.id,
@@ -693,7 +794,9 @@ export function toReport(r) {
       description: f.description,
       usedIn: f.usedIn,
       namedValues: keys(f.analysis.namedValues),
-      backends: keys(f.analysis.backends)
+      backends: keys(f.analysis.backends),
+      fragments: keys(f.analysis.fragments),
+      certificates: keys(f.analysis.certificates)
     })),
     namedValues: r.namedValues,
     unresolvedNamedValues: r.unresolvedNamedValues,
@@ -731,7 +834,13 @@ export function toExport(resolved) {
     apiId: resolved.apiId,
     path: resolved.path,
     serviceUrl: resolved.serviceUrl,
-    backends: resolved.backends.map((b) => ({ id: b.id, url: b.url, missing: !b.exists })),
+    backends: resolved.backends.map((b) => ({
+      id: b.id,
+      url: b.url,
+      missing: !b.exists,
+      dynamic: !!b.dynamic,
+      candidates: b.candidates?.map((c) => c.id) || undefined
+    })),
     products: resolved.products.map((p) => ({ id: p.id, name: p.displayName, state: p.state })),
     fragments: resolved.fragments.map((f) => ({
       id: f.id,

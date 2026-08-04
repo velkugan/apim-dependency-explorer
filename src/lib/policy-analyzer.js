@@ -207,6 +207,18 @@ export function classifyToken(rawToken, { inExpression, inLiquid, knownNamedValu
         reason: 'Inside a Liquid template, but the name matches a named value, which is substituted first.'
       };
     }
+    // Policy expression syntax inside a Liquid body is a real bug worth naming:
+    // Liquid cannot read context, and {{ }} only substitutes named values, so
+    // the token reaches the client verbatim.
+    if (/^context\./.test(token) || /^@[({]/.test(token)) {
+      return {
+        kind: TOKEN_KIND.LIQUID,
+        name: token,
+        reason:
+          'Policy expression syntax inside a Liquid body. Liquid cannot read context, and {{ }} only ' +
+          'substitutes named values, so this is emitted literally rather than evaluated.'
+      };
+    }
     return { kind: TOKEN_KIND.LIQUID, name: token, reason: 'Liquid template variable inside a set-body.' };
   }
 
@@ -242,6 +254,55 @@ export function classifyToken(rawToken, { inExpression, inLiquid, knownNamedValu
     kind: TOKEN_KIND.NAMED_VALUE_UNRESOLVED,
     name: token,
     reason: 'Referenced as a named value but not defined on this API Management instance.'
+  };
+}
+
+/**
+ * A backend-id can be built at runtime:
+ *   backend-id="@("wem-" + context.Variables["site"])"
+ *   backend-id="{{backend-prefix}}01"
+ * Treating the whole string as a literal name reports a live backend as missing.
+ * This turns the value into a glob so the resolver can find every backend it
+ * could select.
+ */
+export function dynamicPattern(value) {
+  if (!value || (!value.includes('{{') && !value.includes('@{') && !value.includes('@('))) {
+    return null;
+  }
+
+  const regions = findExpressionRegions(value);
+  let masked = '';
+  let cursor = 0;
+  for (const [start, end] of regions) {
+    masked += value.slice(cursor, start) + '*';
+    cursor = end + 1;
+  }
+  masked += value.slice(cursor);
+  masked = masked.replace(/\{\{[^{}]*\}\}/g, '*').replace(/\*+/g, '*');
+
+  const first = masked.indexOf('*');
+  if (first === -1) return null;
+
+  // The literal part of a concatenation lives inside the expression, so
+  // "wem-st" in @("wem-st" + context.Variables["site"]) has to be mined out of
+  // the string literals or every backend on the instance becomes a candidate.
+  const hints = [];
+  for (const [start, end] of regions) {
+    const body = value.slice(start, end + 1);
+    for (const match of body.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'/g)) {
+      const literal = (match[1] ?? match[2] ?? '').trim();
+      if (literal.length >= 2 && /[a-z0-9]/i.test(literal)) hints.push(literal);
+    }
+  }
+  hints.sort((a, b) => b.length - a.length);
+
+  return {
+    pattern: masked,
+    prefix: masked.slice(0, first),
+    suffix: masked.slice(masked.lastIndexOf('*') + 1),
+    hints,
+    raw: value,
+    wholeToken: /^\{\{[^{}]+\}\}$/.test(value.trim()) ? value.trim().slice(2, -2).trim() : null
   };
 }
 
@@ -536,7 +597,17 @@ function extractElement(tag, node, ctx) {
   switch (tag) {
     case 'set-backend-service': {
       const backendId = at('backend-id');
-      if (backendId) addTo(analysis.backends, backendId, occurrence, { via: 'set-backend-service' });
+      if (backendId) {
+        const dynamic = dynamicPattern(backendId);
+        addTo(
+          analysis.backends,
+          dynamic ? dynamic.pattern : backendId,
+          occurrence,
+          dynamic
+            ? { via: 'set-backend-service', dynamic: true, ...dynamic }
+            : { via: 'set-backend-service' }
+        );
+      }
       const baseUrl = at('base-url');
       if (baseUrl) addTo(analysis.urls, baseUrl, occurrence, { via: 'set-backend-service base-url' });
       break;
@@ -636,7 +707,15 @@ function extractElement(tag, node, ctx) {
   // Generic: backend-id shows up on several AI gateway policies too.
   if (tag !== 'set-backend-service') {
     const backendId = at('backend-id');
-    if (backendId) addTo(analysis.backends, backendId, occurrence, { via: `${tag}@backend-id` });
+    if (backendId) {
+      const dynamic = dynamicPattern(backendId);
+      addTo(
+        analysis.backends,
+        dynamic ? dynamic.pattern : backendId,
+        occurrence,
+        dynamic ? { via: `${tag}@backend-id`, dynamic: true, ...dynamic } : { via: `${tag}@backend-id` }
+      );
+    }
   }
 }
 

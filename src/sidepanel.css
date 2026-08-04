@@ -212,15 +212,17 @@ label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px
   vertical-align: 1px;
 }
 
-/* the fingerprint: one segment per dependency class */
-.fingerprint { display: flex; gap: 2px; align-items: center; height: 12px; }
-.fingerprint i {
-  display: block;
-  width: 3px;
-  border-radius: 1px;
+/* the fingerprint: a labelled chip per dependency class */
+.fingerprint { display: flex; gap: 3px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.fingerprint .fp {
+  font: 500 9.5px var(--mono);
+  letter-spacing: 0.02em;
+  padding: 0 3px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
   opacity: 0.9;
+  white-space: nowrap;
 }
-.fingerprint .n { font: 500 10px var(--mono); color: var(--faint); margin-left: 4px; }
 
 /* ---------- dependency rail (signature) ---------- */
 

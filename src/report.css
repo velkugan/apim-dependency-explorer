@@ -92,12 +92,40 @@
   opacity: 0.4;
 }
 
-/* Cards flow into as many columns as the window allows. */
+/*
+ * Cards pack vertically into columns rather than sitting on grid rows: with
+ * grid, a one-row card beside a twenty-row card inherits the tall row height
+ * and leaves a chasm underneath it.
+ */
 .report-main {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  display: block;
+}
+
+.report-top,
+.report-wide {
+  display: flex;
+  flex-direction: column;
   gap: 14px;
-  align-items: start;
+}
+
+.report-top:not(:empty) {
+  margin-bottom: 14px;
+}
+
+.report-wide:not(:empty) {
+  margin-top: 14px;
+}
+
+.report-columns {
+  columns: 330px 4;
+  column-gap: 14px;
+}
+
+.report-columns .card {
+  break-inside: avoid;
+  display: inline-block;
+  width: 100%;
+  margin: 0 0 14px;
 }
 
 .card {
@@ -108,8 +136,24 @@
   overflow: hidden;
 }
 
-.card.wide {
-  grid-column: 1 / -1;
+.show-more {
+  display: block;
+  width: 100%;
+  padding: 6px;
+  border: none;
+  border-top: 1px solid var(--line-soft);
+  background: var(--surface-2);
+  color: var(--muted);
+  font: 400 11px var(--mono);
+  cursor: pointer;
+}
+
+.show-more:hover {
+  color: var(--text);
+}
+
+.rows.collapsed .extra {
+  display: none;
 }
 
 .card > header {
@@ -264,10 +308,120 @@
   .report-layout {
     grid-template-columns: 1fr;
   }
-  .report-main {
-    grid-template-columns: 1fr 1fr;
+  .report-columns {
+    columns: 2;
+  }
+  .rows.collapsed .extra {
+    display: grid;
   }
   .card {
     break-inside: avoid;
   }
+}
+
+/* ---------- tree view ---------- */
+
+body.tree-mode .report-top,
+body.tree-mode .report-columns,
+body.tree-mode .report-wide {
+  display: none;
+}
+
+body:not(.tree-mode) .tree-root {
+  display: none;
+}
+
+.tree-root {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 14px 16px;
+}
+
+.tree,
+.tree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Indent guides read as the containment they describe. */
+.tree ul {
+  margin-left: 9px;
+  padding-left: 14px;
+  border-left: 1px solid var(--line);
+}
+
+.tnode {
+  position: relative;
+  padding: 1px 0;
+}
+
+.tnode > details > summary,
+.tnode > .tnode-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 2px;
+}
+
+.tnode > details > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.tnode > details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tnode > details > summary::before {
+  content: '▸';
+  color: var(--faint);
+  font-size: 9px;
+  width: 9px;
+}
+
+.tnode > details[open] > summary::before {
+  content: '▾';
+  color: var(--stem, var(--faint));
+}
+
+.tnode > details > summary:hover,
+.tnode > .tnode-head:hover {
+  background: var(--surface-2);
+}
+
+.tnode > .tnode-head {
+  padding-left: 13px;
+}
+
+.tkind {
+  font: 500 9.5px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--stem, var(--muted));
+  min-width: 74px;
+  opacity: 0.85;
+}
+
+.tlabel {
+  font: 500 12.5px var(--mono);
+  word-break: break-all;
+}
+
+.tnode.g-issue .tlabel {
+  color: var(--c-issue);
+}
+
+.tdetail {
+  font: 400 11px var(--mono);
+  color: var(--faint);
+  word-break: break-all;
+}
+
+.tcount {
+  font: 400 10px var(--mono);
+  color: var(--faint);
+  margin-left: auto;
 }

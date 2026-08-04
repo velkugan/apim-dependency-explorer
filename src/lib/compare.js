@@ -260,6 +260,32 @@ export async function compareApi(targetSvc, index, resolved, options = {}) {
 
   // --- backends -------------------------------------------------------------
   for (const backend of resolved.backends) {
+    // A dynamic backend-id can select any of its candidates at runtime, so each
+    // one has to exist in the target, not just one of them.
+    if (backend.dynamic) {
+      if (!backend.candidates?.length) {
+        add({
+          kind: 'backend (dynamic)',
+          name: backend.id,
+          verdict: 'differs',
+          detail: 'built at runtime with no literal part to match on — check this one by hand'
+        });
+        continue;
+      }
+      const absent = backend.candidates.filter((c) => !lookup(index.backends, c.id, pattern).item);
+      add({
+        kind: 'backend (dynamic)',
+        name: backend.id,
+        verdict: absent.length ? 'missing' : 'present',
+        detail: absent.length
+          ? `${absent.length} of ${backend.candidates.length} candidates absent in target: ${absent
+              .map((c) => c.id)
+              .join(', ')}`
+          : `all ${backend.candidates.length} candidates present in target`
+      });
+      continue;
+    }
+
     check('backend', backend.id, 'backends', (item) => {
       const targetUrl = item.properties?.url;
       if (backend.url && targetUrl && backend.url !== targetUrl) {

@@ -1308,6 +1308,7 @@ async function openReport(resolvedList, focusApiId = null) {
   const payload = {
     service: state.service?.ref || null,
     target: state.targetIndex?.ref || null,
+    apiVersion: els.apiVersion.value,
     generatedAt: new Date().toISOString(),
     // The window opens on the API you asked for, not whichever resolved first.
     focus: focusApiId,

@@ -1,5 +1,8 @@
 import { $, h, copy } from './lib/util.js';
 import { comparisonToText } from './lib/compare.js';
+import { ArmClient } from './lib/arm.js';
+import { ApimService } from './lib/apim.js';
+import { normalizeXml, diffLines, collapseUnchanged, diffStats, diffFields } from './lib/diff.js';
 
 const params = new URLSearchParams(location.search);
 const payloadKey = params.get('key');
@@ -13,6 +16,8 @@ const els = {
   nav: $('#nav'),
   main: $('#main'),
   filter: $('#filter'),
+  explorerTree: $('#explorer-tree'),
+  detail: $('#detail'),
   copyList: $('#copy-list'),
   copyJson: $('#copy-json'),
   copyGaps: $('#copy-gaps'),
@@ -67,10 +72,12 @@ async function boot() {
 
   els.viewToggle = h(
     'button',
-    { class: 'ghost small', type: 'button', onClick: toggleView },
+    { class: 'ghost small', type: 'button', onClick: cycleView, title: 'Cards → Tree → Explorer' },
     'Tree view'
   );
   els.copyList.before(els.viewToggle);
+
+  initExplorer(payload);
 
   show(payload.apis[initial]);
 }
@@ -488,6 +495,7 @@ function show(api) {
     else columns.append(node);
   }
   els.main.replaceChildren(top, columns, wide);
+  if (state.view === 'explorer') renderExplorer();
   if (document.body.classList.contains('tree-mode')) {
     els.main.append(h('div', { id: 'tree-root', class: 'tree-root' }, buildTree(api)));
   }
@@ -750,12 +758,583 @@ function buildTree(api) {
   );
 }
 
-function toggleView() {
-  const treeMode = document.body.classList.toggle('tree-mode');
-  els.viewToggle.textContent = treeMode ? 'Card view' : 'Tree view';
-  if (treeMode && !$('#tree-root')) {
+const VIEWS = ['cards', 'tree', 'explorer'];
+const NEXT_LABEL = { cards: 'Tree view', tree: 'Explorer', explorer: 'Card view' };
+
+function cycleView() {
+  const current = state.view || 'cards';
+  setView(VIEWS[(VIEWS.indexOf(current) + 1) % VIEWS.length]);
+}
+
+function setView(view) {
+  state.view = view;
+  document.body.classList.toggle('tree-mode', view === 'tree');
+  document.body.classList.toggle('explorer-mode', view === 'explorer');
+  els.viewToggle.textContent = NEXT_LABEL[view];
+
+  if (view === 'tree' && !$('#tree-root')) {
     els.main.append(h('div', { id: 'tree-root', class: 'tree-root' }, buildTree(state.current)));
   }
+  if (view === 'explorer') renderExplorer();
+}
+
+
+// ---------------------------------------------------------------------------
+// explorer: tree on the left, source | target detail on the right
+// ---------------------------------------------------------------------------
+
+const explorer = {
+  client: null,
+  source: null,
+  target: null,
+  selected: null,
+  policyCache: new Map(),
+  raw: false
+};
+
+/**
+ * The report window is an extension page, so it holds the same host permissions
+ * as the panel and can call ARM directly. The token lives in session storage
+ * where the panel put it.
+ */
+function initExplorer(payload) {
+  // payload.apiVersion is written by the panel; fall back if an older report
+  // is reopened from session storage.
+  explorer.client = new ArmClient({
+    getToken: async () => {
+      const stored = await chrome.storage.session.get('manualToken');
+      return stored?.manualToken || null;
+    },
+    concurrency: 4
+  });
+  const version = payload.apiVersion || '2022-08-01';
+  if (payload.service) explorer.source = new ApimService(explorer.client, payload.service, version);
+  if (payload.target) explorer.target = new ApimService(explorer.client, payload.target, version);
+}
+
+/** Cache key covers side + kind + id so nothing collides. */
+async function policyFor(side, kind, id, opId) {
+  const svc = side === 'target' ? explorer.target : explorer.source;
+  if (!svc) return { xml: null, unavailable: 'no instance configured' };
+
+  const key = `${side}:${kind}:${id}:${opId || ''}`;
+  if (explorer.policyCache.has(key)) return explorer.policyCache.get(key);
+
+  const load = async () => {
+    try {
+      if (kind === 'api') return { xml: await svc.getApiPolicy(id) };
+      if (kind === 'operation') return { xml: await svc.getOperationPolicy(id, opId) };
+      if (kind === 'product') return { xml: await svc.getProductPolicy(id) };
+      if (kind === 'fragment') return { xml: await svc.getFragmentPolicy(id) };
+      return { xml: null };
+    } catch (err) {
+      if (err.name === 'AuthError') return { xml: null, unavailable: err.message };
+      return { xml: null, unavailable: err.message };
+    }
+  };
+
+  const promise = load();
+  explorer.policyCache.set(key, promise);
+  return promise;
+}
+
+async function resourceFor(side, kind, id) {
+  const svc = side === 'target' ? explorer.target : explorer.source;
+  if (!svc) return null;
+  try {
+    if (kind === 'backend') return await svc.getBackend(id);
+    if (kind === 'named value') return await svc.getNamedValue(id);
+    if (kind === 'certificate') return await svc.getCertificate(id);
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+// --- selectable tree --------------------------------------------------------
+
+function explorerNode(entry, depth = 0) {
+  const cls = KIND_CLASS[entry.kind] || 'g-plain';
+  const head = h(
+    'button',
+    {
+      class: `xnode-head ${cls}`,
+      type: 'button',
+      style: `padding-left:${8 + depth * 13}px`,
+      onClick: () => selectNode(entry)
+    },
+    h('span', { class: 'tkind' }, entry.kind),
+    h('span', { class: 'tlabel' }, entry.label),
+    entry.badge ? h('span', { class: 'xbadge' }, entry.badge) : null
+  );
+  entry.el = head;
+
+  if (!entry.children?.length) return h('li', { class: 'xnode' }, head);
+  return h(
+    'li',
+    { class: 'xnode' },
+    h(
+      'details',
+      entry.open ? { open: true } : null,
+      h('summary', null, head),
+      h('ul', null, ...entry.children.map((child) => explorerNode(child, depth + 1)))
+    )
+  );
+}
+
+/** Flat, selectable model of everything worth opening a detail pane on. */
+function explorerModel(api) {
+  const children = [];
+
+  children.push({
+    kind: 'policy',
+    label: 'API policy',
+    detailKind: 'policy',
+    policy: { kind: 'api', id: api.apiId },
+    open: true
+  });
+
+  if (api.allOperations?.length) {
+    children.push({
+      kind: 'operation',
+      label: `Operations (${api.allOperations.length})`,
+      detailKind: 'summary',
+      summary: 'operations',
+      children: api.allOperations.map((op) => ({
+        kind: 'operation',
+        label: op.displayName,
+        badge: op.method,
+        detailKind: 'policy',
+        policy: { kind: 'operation', id: api.apiId, opId: op.id },
+        meta: op
+      }))
+    });
+  }
+
+  if (api.products?.length) {
+    children.push({
+      kind: 'product',
+      label: `Products (${api.products.length})`,
+      detailKind: 'summary',
+      summary: 'products',
+      children: api.products.map((p) => ({
+        kind: 'product',
+        label: p.displayName,
+        badge: p.state,
+        detailKind: 'policy',
+        policy: { kind: 'product', id: p.id },
+        meta: p
+      }))
+    });
+  }
+
+  if (api.fragments?.length) {
+    children.push({
+      kind: 'fragment',
+      label: `Policy fragments (${api.fragments.length})`,
+      detailKind: 'summary',
+      summary: 'fragments',
+      children: api.fragments.map((f) => ({
+        kind: f.exists ? 'fragment' : 'missing',
+        label: f.id,
+        badge: f.depth ? `L${f.depth}` : null,
+        detailKind: 'policy',
+        policy: { kind: 'fragment', id: f.id },
+        meta: f
+      }))
+    });
+  }
+
+  if (api.backends?.length) {
+    children.push({
+      kind: 'backend',
+      label: `Backends (${api.backends.length})`,
+      detailKind: 'summary',
+      summary: 'backends',
+      children: api.backends.map((b) => ({
+        kind: b.exists ? 'backend' : 'missing',
+        label: b.id,
+        badge: b.dynamic ? 'dyn' : null,
+        detailKind: 'resource',
+        resource: { kind: 'backend', id: b.dynamic ? b.candidates?.[0]?.id : b.id },
+        meta: b
+      }))
+    });
+  }
+
+  if (api.namedValues?.length) {
+    children.push({
+      kind: 'named value',
+      label: `Named values (${api.namedValues.length})`,
+      detailKind: 'summary',
+      summary: 'namedValues',
+      children: api.namedValues.map((n) => ({
+        kind: n.exists ? 'named value' : 'missing',
+        label: n.token,
+        badge: n.keyVault ? 'kv' : n.secret ? 'sec' : null,
+        detailKind: 'resource',
+        resource: { kind: 'named value', id: n.id || n.token },
+        meta: n
+      }))
+    });
+  }
+
+  if (api.certificates?.length) {
+    children.push({
+      kind: 'certificate',
+      label: `Certificates (${api.certificates.length})`,
+      detailKind: 'summary',
+      summary: 'certificates',
+      children: api.certificates.map((c) => ({
+        kind: c.exists ? 'certificate' : 'missing',
+        label: c.id,
+        detailKind: 'resource',
+        resource: { kind: 'certificate', id: c.id },
+        meta: c
+      }))
+    });
+  }
+
+  return {
+    kind: 'policy',
+    label: api.apiLabel,
+    badge: `/${api.path || ''}`,
+    detailKind: 'overview',
+    open: true,
+    children
+  };
+}
+
+// --- detail rendering -------------------------------------------------------
+
+function diffPane(rows, side) {
+  const wrap = h('div', { class: 'diff-pane' });
+  for (const rowEntry of rows) {
+    if (rowEntry.type === 'gap') {
+      wrap.append(h('div', { class: 'dline gap' }, `⋯ ${rowEntry.count} unchanged`));
+      continue;
+    }
+    const isLeft = side === 'source';
+    // A line added on the right has no left counterpart, and vice versa; render
+    // a spacer so the two panes stay aligned as you scroll.
+    const blank = (isLeft && rowEntry.type === 'add') || (!isLeft && rowEntry.type === 'del');
+    const no = isLeft ? rowEntry.leftNo : rowEntry.rightNo;
+    wrap.append(
+      h(
+        'div',
+        { class: `dline ${blank ? 'blank' : rowEntry.type}` },
+        h('span', { class: 'dno' }, blank ? '' : String(no ?? '')),
+        h('span', { class: 'dtext' }, blank ? '' : rowEntry.text)
+      )
+    );
+  }
+  return wrap;
+}
+
+function detailHeader(title, subtitle, extra) {
+  return h(
+    'div',
+    { class: 'detail-head' },
+    h('h2', null, title),
+    subtitle ? h('span', { class: 'detail-sub' }, subtitle) : null,
+    extra || null
+  );
+}
+
+async function showPolicyDetail(entry) {
+  const pane = els.detail;
+  pane.replaceChildren(
+    detailHeader(entry.label, entry.kind),
+    h('p', { class: 'loading' }, 'Reading policy')
+  );
+
+  const spec = entry.policy;
+  const [source, target] = await Promise.all([
+    policyFor('source', spec.kind, spec.id, spec.opId),
+    explorer.target ? policyFor('target', spec.kind, spec.id, spec.opId) : Promise.resolve(null)
+  ]);
+
+  if (state.detailToken !== entry) return; // a newer selection won the race
+
+  const normSource = explorer.raw
+    ? { text: source.xml || '', ok: true }
+    : normalizeXml(source.xml || '');
+  const normTarget = target
+    ? explorer.raw
+      ? { text: target.xml || '', ok: true }
+      : normalizeXml(target.xml || '')
+    : null;
+
+  const rawToggle = h(
+    'button',
+    {
+      class: 'link',
+      type: 'button',
+      onClick: () => {
+        explorer.raw = !explorer.raw;
+        selectNode(entry);
+      }
+    },
+    explorer.raw ? 'normalised view' : 'raw view'
+  );
+
+  if (!normTarget) {
+    // No target configured: single pane.
+    pane.replaceChildren(
+      detailHeader(entry.label, entry.kind, rawToggle),
+      source.unavailable
+        ? h('p', { class: 'note' }, source.unavailable)
+        : source.xml
+        ? h('pre', { class: 'policy-pre' }, normSource.text)
+        : h('p', { class: 'note' }, 'No policy defined at this scope.')
+    );
+    return;
+  }
+
+  const rows = diffLines(normSource.text, normTarget.text);
+  const stats = diffStats(rows);
+  const shown = stats.identical ? rows : collapseUnchanged(rows, 4);
+
+  const verdict = stats.identical
+    ? h('span', { class: 'verdict same' }, 'identical')
+    : h('span', { class: 'verdict diff' }, `+${stats.added} / −${stats.removed}`);
+
+  pane.replaceChildren(
+    detailHeader(entry.label, entry.kind, h('span', { class: 'head-extra' }, verdict, rawToggle)),
+    h(
+      'div',
+      { class: 'diff-grid' },
+      h(
+        'div',
+        { class: 'diff-col' },
+        h('h3', null, 'Source', h('span', { class: 'diff-sub' }, explorer.source?.label || '')),
+        source.xml ? diffPane(shown, 'source') : h('p', { class: 'note' }, 'No policy at this scope.')
+      ),
+      h(
+        'div',
+        { class: 'diff-col' },
+        h('h3', null, 'Target', h('span', { class: 'diff-sub' }, explorer.target?.label || '')),
+        target.unavailable
+          ? h('p', { class: 'note' }, target.unavailable)
+          : target.xml
+          ? diffPane(shown, 'target')
+          : h('p', { class: 'note' }, 'Not defined in the target.')
+      )
+    )
+  );
+}
+
+const BACKEND_FIELDS = [
+  { key: 'url', label: 'URL' },
+  { key: 'protocol', label: 'Protocol' },
+  { key: 'title', label: 'Title' },
+  { key: 'description', label: 'Description' },
+  { key: 'resourceId', label: 'Resource ID' }
+];
+
+async function showResourceDetail(entry) {
+  const pane = els.detail;
+  pane.replaceChildren(detailHeader(entry.label, entry.kind), h('p', { class: 'loading' }, 'Reading resource'));
+
+  const kind = entry.resource.kind;
+  const id = entry.resource.id;
+  const [source, target] = await Promise.all([
+    resourceFor('source', kind, id),
+    explorer.target ? resourceFor('target', kind, id) : Promise.resolve(null)
+  ]);
+  if (state.detailToken !== entry) return;
+
+  let fields;
+  if (kind === 'backend') {
+    fields = diffFields(source?.properties, target?.properties, [
+      ...BACKEND_FIELDS,
+      {
+        key: 'credentials',
+        label: 'Credentials',
+        format: (v) => (v ? Object.keys(v).join(', ') : null)
+      }
+    ]);
+  } else if (kind === 'named value') {
+    // Secrets are never shown side by side; only whether they match.
+    const mask = (props) =>
+      props
+        ? {
+            value: props.secret ? '••••••' : props.value,
+            secret: props.secret ? 'yes' : 'no',
+            keyVault: props.keyVault?.secretIdentifier || null,
+            identity: props.keyVault?.identityClientId || null,
+            refresh: props.keyVault?.lastStatus?.code || null,
+            tags: props.tags?.join(', ') || null
+          }
+        : null;
+    fields = diffFields(mask(source?.properties), mask(target?.properties), [
+      { key: 'value', label: 'Value' },
+      { key: 'secret', label: 'Secret' },
+      { key: 'keyVault', label: 'Key Vault secret' },
+      { key: 'identity', label: 'Identity' },
+      { key: 'refresh', label: 'Last refresh' },
+      { key: 'tags', label: 'Tags' }
+    ]);
+    for (const row of fields) {
+      if (row.key === 'value' && source?.properties?.secret) {
+        row.differs = false;
+        row.note = 'secret values are not compared';
+      }
+    }
+  } else {
+    fields = diffFields(source?.properties, target?.properties, [
+      { key: 'subject', label: 'Subject' },
+      { key: 'thumbprint', label: 'Thumbprint' },
+      { key: 'expirationDate', label: 'Expires' }
+    ]);
+  }
+
+  const meta = entry.meta || {};
+  const extras = [];
+  if (meta.dynamic) {
+    extras.push(
+      h(
+        'p',
+        { class: 'note' },
+        `Selected at runtime (${meta.resolvedVia}). Candidates: ${
+          meta.candidates?.map((c) => c.id).join(', ') || 'none matched'
+        }`
+      )
+    );
+  }
+  if (meta.usedIn?.length) {
+    const scopes = [...new Set(meta.usedIn.map((o) => o.scope).filter(Boolean))];
+    if (scopes.length) extras.push(h('p', { class: 'note' }, `Used in ${scopes.join(', ')}`));
+  }
+
+  const differing = fields.filter((f) => f.differs).length;
+  pane.replaceChildren(
+    detailHeader(
+      entry.label,
+      entry.kind,
+      explorer.target
+        ? differing
+          ? h('span', { class: 'verdict diff' }, `${differing} field(s) differ`)
+          : h('span', { class: 'verdict same' }, 'identical')
+        : null
+    ),
+    ...extras,
+    h(
+      'table',
+      { class: 'field-table' },
+      h(
+        'thead',
+        null,
+        h(
+          'tr',
+          null,
+          h('th', null, 'Field'),
+          h('th', null, 'Source'),
+          explorer.target ? h('th', null, 'Target') : null
+        )
+      ),
+      h(
+        'tbody',
+        null,
+        ...fields.map((f) =>
+          h(
+            'tr',
+            { class: f.differs ? 'differs' : null },
+            h('td', null, f.label),
+            h('td', null, f.source ?? '—'),
+            explorer.target ? h('td', null, f.note || (f.target ?? '—')) : null
+          )
+        )
+      )
+    ),
+    !source && !target ? h('p', { class: 'note' }, 'Not found in either instance.') : null
+  );
+}
+
+function showOverview(api) {
+  const c = api.counts || {};
+  els.detail.replaceChildren(
+    detailHeader(api.apiLabel, `/${api.path || ''}`),
+    h(
+      'p',
+      { class: 'note' },
+      'Pick anything on the left to see its detail. Policies show a source/target diff; ' +
+        'backends, named values and certificates show a field comparison.'
+    ),
+    h(
+      'table',
+      { class: 'field-table' },
+      h(
+        'tbody',
+        null,
+        ...[
+          ['Service URL', api.serviceUrl || '—'],
+          ['Revision', api.revision ?? '1'],
+          ['Operations', String(api.allOperations?.length ?? 0)],
+          ['Backends', String(c.backends ?? 0)],
+          ['Products', String(c.products ?? 0)],
+          ['Fragments', String(c.fragments ?? 0)],
+          ['Named values', String(c.namedValues ?? 0)],
+          ['Key Vault secrets', String(c.keyVault ?? 0)],
+          ['Broken references', String(c.issues ?? 0)]
+        ].map(([k, v]) => h('tr', null, h('td', null, k), h('td', null, v)))
+      )
+    )
+  );
+}
+
+function showSummary(entry, api) {
+  const map = {
+    operations: api.allOperations || [],
+    products: api.products || [],
+    fragments: api.fragments || [],
+    backends: api.backends || [],
+    namedValues: api.namedValues || [],
+    certificates: api.certificates || []
+  };
+  const list = map[entry.summary] || [];
+  els.detail.replaceChildren(
+    detailHeader(entry.label, 'group'),
+    h('p', { class: 'note' }, 'Select an item on the left to compare it.'),
+    h(
+      'ul',
+      { class: 'plain-list' },
+      ...list.map((x) =>
+        h('li', null, x.displayName || x.token || x.id || String(x))
+      )
+    )
+  );
+}
+
+async function selectNode(entry) {
+  state.detailToken = entry;
+  explorer.selected = entry;
+
+  for (const el of document.querySelectorAll('.xnode-head.selected')) {
+    el.classList.remove('selected');
+  }
+  entry.el?.classList.add('selected');
+
+  try {
+    if (entry.detailKind === 'policy') await showPolicyDetail(entry);
+    else if (entry.detailKind === 'resource') await showResourceDetail(entry);
+    else if (entry.detailKind === 'summary') showSummary(entry, state.current);
+    else showOverview(state.current);
+  } catch (err) {
+    els.detail.replaceChildren(
+      detailHeader(entry.label, entry.kind),
+      h('p', { class: 'error' }, err.message)
+    );
+  }
+}
+
+function renderExplorer() {
+  const api = state.current;
+  const root = explorerModel(api);
+
+  els.explorerTree.replaceChildren(h('ul', { class: 'xtree' }, explorerNode(root)));
+  els.detail.replaceChildren();
+  selectNode(root);
 }
 
 function renderNav() {

@@ -3,6 +3,8 @@ import { comparisonToText } from './lib/compare.js';
 import { ArmClient } from './lib/arm.js';
 import { ApimService } from './lib/apim.js';
 import { normalizeXml, diffLines, collapseUnchanged, diffStats, diffFields } from './lib/diff.js';
+import { buildTemplateBundle } from './lib/arm-templates.js';
+import { makeZip, downloadBlob } from './lib/zip.js';
 
 const params = new URLSearchParams(location.search);
 const payloadKey = params.get('key');
@@ -21,6 +23,7 @@ const els = {
   copyList: $('#copy-list'),
   copyJson: $('#copy-json'),
   copyGaps: $('#copy-gaps'),
+  genTemplates: $('#gen-templates'),
   print: $('#print')
 };
 
@@ -69,6 +72,7 @@ async function boot() {
   els.copyGaps.addEventListener('click', () =>
     copyWith(els.copyGaps, () => comparisonToText(state.current.comparison, state.current.apiLabel))
   );
+  els.genTemplates.addEventListener('click', generateTemplates);
 
   els.viewToggle = h(
     'button',
@@ -213,6 +217,7 @@ function show(api) {
   state.current = api;
   cards.length = 0;
   els.copyGaps.hidden = !api.comparison;
+  els.genTemplates.hidden = !api.comparison;
 
   els.title.textContent = api.apiLabel;
   els.meta.textContent = [
@@ -1336,6 +1341,102 @@ function renderExplorer() {
   els.detail.replaceChildren();
   selectNode(root);
 }
+
+// ---------------------------------------------------------------------------
+// ARM template generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Emits one ARM template per resource that the target is missing. Definitions
+ * are read from the source instance rather than the report payload, so the
+ * templates carry every property (credentials, tls, proxy) rather than only the
+ * subset the dependency view needed.
+ */
+async function generateTemplates() {
+  const api = state.current;
+  const comparison = api?.comparison;
+  if (!comparison) return;
+
+  const label = els.genTemplates.textContent;
+  els.genTemplates.textContent = 'Generating…';
+  els.genTemplates.disabled = true;
+
+  try {
+    const missing = comparison.items.filter((i) => i.verdict === 'missing');
+    const wantNamedValues = missing.filter((i) => i.kind === 'named value').map((i) => i.name);
+    const wantBackends = missing
+      .filter((i) => i.kind === 'backend' || i.kind === 'backend (dynamic)')
+      .flatMap((i) =>
+        i.kind === 'backend (dynamic)'
+          ? // A dynamic backend lists its absent candidates in the detail text.
+            (api.backends.find((b) => b.id === i.name)?.candidates || []).map((c) => c.id)
+          : [i.name]
+      );
+    const wantFragments = missing.filter((i) => i.kind === 'policy fragment').map((i) => i.name);
+
+    if (!wantNamedValues.length && !wantBackends.length && !wantFragments.length) {
+      els.genTemplates.textContent = 'Nothing missing';
+      setTimeout(() => {
+        els.genTemplates.textContent = label;
+      }, 1600);
+      return;
+    }
+
+    const [namedValues, backends, fragments] = await Promise.all([
+      Promise.all(wantNamedValues.map((name) => resourceFor('source', 'named value', name))),
+      Promise.all(wantBackends.map((name) => resourceFor('source', 'backend', name))),
+      Promise.all(
+        wantFragments.map(async (name) => {
+          const xml = await policyFor('source', 'fragment', name);
+          const meta = api.fragments.find((f) => f.id === name);
+          return { name, description: meta?.description || '', xml: xml?.xml || '' };
+        })
+      )
+    ]);
+
+    const files = buildTemplateBundle({
+      namedValues: namedValues.filter(Boolean),
+      backends: backends.filter(Boolean),
+      fragments: fragments.filter((f) => f && f.xml !== undefined),
+      apiVersion: state.payload?.apiVersion || '2022-08-01',
+      context: {
+        source: explorer.source?.label || state.payload?.service?.serviceName,
+        target: comparison.target,
+        api: api.apiLabel
+      }
+    });
+
+    if (!files.length) {
+      els.genTemplates.textContent = 'Nothing to write';
+      setTimeout(() => {
+        els.genTemplates.textContent = label;
+      }, 1600);
+      return;
+    }
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadBlob(
+      `apim-templates-${safeName(comparison.target)}-${safeName(api.apiId)}-${stamp}.zip`,
+      makeZip(files)
+    );
+
+    const counts = files.filter((f) => f.name.endsWith('.json') && f.name.includes('/')).length;
+    els.genTemplates.textContent = `${counts} template(s)`;
+    setTimeout(() => {
+      els.genTemplates.textContent = label;
+    }, 2200);
+  } catch (err) {
+    els.genTemplates.textContent = 'Failed';
+    console.error('APIM template generation failed', err);
+    setTimeout(() => {
+      els.genTemplates.textContent = label;
+    }, 2200);
+  } finally {
+    els.genTemplates.disabled = false;
+  }
+}
+
+const safeName = (value) => String(value || 'apim').replace(/[^A-Za-z0-9._-]+/g, '-');
 
 function renderNav() {
   els.nav.replaceChildren(

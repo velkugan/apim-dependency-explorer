@@ -59,8 +59,9 @@ instead. **Find services** lists every APIM instance the token can see.
 | --- | --- |
 | `sidePanel` | The UI itself |
 | `storage` | Settings in local storage; token and report payloads in session storage |
-| `webRequest` | Optional token capture from ARM traffic (observe only) |
-| `host_permissions: management.azure.com` | The only host the extension calls |
+| `webRequest` | Optional token capture from ARM *and* Application Insights traffic (observe only) |
+| `host_permissions: management.azure.com` | ARM — APIM, catalog, and the Application Insights AppId lookup |
+| `host_permissions: api.applicationinsights.io` | The Troubleshoot feature's actual log query, a separate token audience from ARM |
 | `host_permissions: portal.azure.*` | Required for the initiator check on captured requests, and to read the active tab's URL without the broad `tabs` permission |
 
 Read-only: the extension issues no ARM writes. The token lives in
@@ -232,12 +233,53 @@ src/lib/arm.js               ARM client: paging, 429 retry, caching
 src/lib/apim.js              APIM endpoints, resource-ID parsing, service discovery
 src/lib/policy-analyzer.js   the named value / variable / Liquid classifier
 src/lib/resolver.js          catalog load, per-API resolution, scope graph
+src/lib/appinsights.js       Troubleshoot: recent App Insights logs via the ARM proxy
 src/lib/compare.js           target indexing and gap comparison
 src/lib/diff.js              XML normalisation and line diff
 src/lib/arm-templates.js     ARM template generation
 src/lib/zip.js               minimal store-only ZIP writer
 tools/test-analyzer.mjs      classifier tests, runnable in Node
 ```
+
+## Troubleshoot (Application Insights logs)
+
+Any API diagnostic backed by an `applicationInsights` logger shows a
+**troubleshoot** link next to it, in both the side panel and the report.
+Clicking it opens a panel with recent `requests`/`traces`/`exceptions` for
+that Application Insights resource — a lookback window (15m–24h), a free-text
+filter (defaults to the API's display name), and an "Open in portal" link for
+anything that needs the full Logs experience.
+
+Querying Application Insights needs a **second bearer token**, separate from
+the ARM token used for everything else. There is no way around this: ARM has
+no proxy for querying a Microsoft.Insights/components resource's own logs (it
+only exists for resources that *send* diagnostic logs elsewhere), so the
+actual data lives behind the dedicated Query API, which requires a token
+whose audience is specifically `https://api.applicationinsights.io`:
+
+```
+POST https://api.applicationinsights.io/v1/apps/{appId}/query
+```
+
+The panel gets that token the same three ways it gets the ARM one:
+
+- **Capture it.** With "Capture token from Azure portal traffic" ticked, if
+  you open the resource's own **Logs** blade in the Azure portal at least
+  once during the session, the extension picks up that request's token the
+  same way it picks up ARM tokens. (This needs the
+  `https://api.applicationinsights.io/*` host permission added in this
+  version — reload the unpacked extension once after updating.)
+- **Paste it.** The troubleshoot panel shows a paste box whenever it doesn't
+  have a working token, same idea as the main "Bearer token" field.
+- **Azure CLI:**
+  `az account get-access-token --resource https://api.applicationinsights.io --query accessToken -o tsv`
+
+The `AppId` used in the query URL (not the ARM resource name) is read
+automatically with the normal ARM token via a plain `Components - Get` call.
+A 401/403 from the query itself means the Application Insights token is
+wrong/expired/wrong-audience, not an APIM permission issue — the panel shows
+the paste box again in that case. See `src/lib/appinsights.js` for the full
+explanation and both calls.
 
 ## Known limits
 

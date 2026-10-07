@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "APIM Dependency Explorer",
-  "version": "0.6.0",
+  "version": "0.7.1",
   "description": "Resolves what each Azure API Management API depends on: backends, products, policy fragments, named values and Key Vault secrets. Compares against a target environment and generates ARM templates for what is missing.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -11,6 +11,7 @@
   ],
   "host_permissions": [
     "https://management.azure.com/*",
+    "https://api.applicationinsights.io/*",
     "https://portal.azure.com/*",
     "https://*.portal.azure.com/*",
     "https://*.portal.azure.net/*"

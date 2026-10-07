@@ -686,7 +686,10 @@ function group(title, className, count, children, note) {
   if (!children || (Array.isArray(children) && !children.length)) return null;
   const section = h('section', { class: `group ${className}` });
   const button = copyButton('copy', () =>
-    [...section.querySelectorAll('.item > .head > .name')].map((n) => n.textContent).join('\n')
+    [...section.querySelectorAll('.item')]
+      .map((el) => el.dataset.copy || el.querySelector('.head > .name')?.textContent || '')
+      .filter(Boolean)
+      .join('\n')
   );
   add(section, 
     h('h3', null, title, h('span', { class: 'count' }, count), button),
@@ -807,11 +810,18 @@ function sourcesOf(refs) {
 }
 
 function item(name, opts = {}) {
-  const { sub, why, missing, pill, pillColor, refs, onCopy } = opts;
+  const { sub, why, missing, pill, pillColor, refs, onCopy, copyText } = opts;
   const sources = sourcesOf(refs);
+
+  // A bare name is useless for an operation, where the method and path are the
+  // identity. Callers can override; the default folds in the pill and subtitle.
+  const copyAs =
+    copyText ??
+    [pill, name, sub && !String(sub).includes('\n') ? sub : null].filter(Boolean).join('  ');
+
   return h(
     'div',
-    { class: `item${missing ? ' missing' : ''}` },
+    { class: `item${missing ? ' missing' : ''}`, dataset: { copy: copyAs } },
     h(
       'div',
       { class: 'head' },
@@ -1241,6 +1251,7 @@ function renderResolved(r) {
         r.operations.map((op) =>
           item(op.displayName, {
             sub: `${op.method || ''} ${op.urlTemplate || ''}`.trim(),
+            copyText: `${op.method || ''} ${op.urlTemplate || ''}`.trim() + `  ${op.displayName}`,
             why: [
               op.analysis.namedValues.size ? `${op.analysis.namedValues.size} named value(s)` : null,
               op.analysis.backends.size ? `${op.analysis.backends.size} backend(s)` : null,

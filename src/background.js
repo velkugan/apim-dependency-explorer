@@ -19,6 +19,7 @@ const TOKEN_KEY = 'capturedToken';
 const SEEN_KEY = 'captureSeen';
 const DETECTED_KEY = 'detectedService';
 const FLAG_KEY = 'captureEnabled';
+const LOGS_TOKEN_KEY = 'capturedLogsToken';
 
 const panelBehavior = () =>
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -36,6 +37,7 @@ const SERVICE_RE =
   /\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)\/providers\/Microsoft\.ApiManagement\/service\/([^/?#]+)/i;
 
 let lastStoredToken = null;
+let lastStoredLogsToken = null;
 let lastSeenWrite = 0;
 let lastDetectedId = null;
 
@@ -110,3 +112,34 @@ const extra = ['requestHeaders', 'extraHeaders'];
 // idempotent, so a duplicate is harmless.
 chrome.webRequest.onBeforeSendHeaders.addListener(handle, filter, extra);
 chrome.webRequest.onSendHeaders.addListener(handle, filter, extra);
+
+/**
+ * Application Insights telemetry lives behind a *different* AAD audience
+ * (https://api.applicationinsights.io) than everything else this extension
+ * calls. There's no way to derive that token from the ARM one, so — same
+ * idea as `handle()` above — it's captured passively if the portal happens
+ * to make a request to that host (for example, opening the resource's own
+ * Logs blade) while capture is enabled. See lib/appinsights.js.
+ */
+async function handleLogsToken(details) {
+  const { [FLAG_KEY]: enabled } = await chrome.storage.local.get(FLAG_KEY);
+  if (!enabled) return;
+
+  const header = (details.requestHeaders || []).find(
+    (h) => h.name.toLowerCase() === 'authorization'
+  );
+  const value = header?.value?.trim() || '';
+  if (!/^bearer\s+/i.test(value)) return;
+
+  const token = value.replace(/^bearer\s+/i, '');
+  if (!looksLikeJwt(token) || token === lastStoredLogsToken) return;
+  lastStoredLogsToken = token;
+
+  await chrome.storage.session.set({
+    [LOGS_TOKEN_KEY]: { token, capturedAt: Date.now(), url: details.url.split('?')[0] }
+  });
+}
+
+const logsFilter = { urls: ['https://api.applicationinsights.io/*'] };
+chrome.webRequest.onBeforeSendHeaders.addListener(handleLogsToken, logsFilter, extra);
+chrome.webRequest.onSendHeaders.addListener(handleLogsToken, logsFilter, extra);

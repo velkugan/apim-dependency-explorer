@@ -140,10 +140,24 @@ function sourcesOf(refs) {
 }
 
 function row(name, opts = {}) {
-  const { sub, why, pill, pillColor, missing, refs } = opts;
+  const { sub, why, pill, pillColor, missing, refs, copyText } = opts;
+
+  // What the card's copy button should emit for this row. A bare name is
+  // useless for an operation, where the method and path are the identity, so
+  // callers can override and the default folds in the pill and subtitle.
+  const copyAs =
+    copyText ??
+    [pill, name, sub && !String(sub).includes('\n') ? sub : null].filter(Boolean).join('  ');
+
   return h(
     'div',
-    { class: `row-item${missing ? ' missing' : ''}`, dataset: { search: `${name} ${sub || ''} ${why || ''}`.toLowerCase() } },
+    {
+      class: `row-item${missing ? ' missing' : ''}`,
+      dataset: {
+        search: `${name} ${sub || ''} ${why || ''}`.toLowerCase(),
+        copy: copyAs
+      }
+    },
     h('span', { class: 'rname' }, name),
     pill ? h('span', { class: 'pill', style: pillColor ? `color:${pillColor}` : null }, pill) : null,
     sub ? h('span', { class: 'rsub' }, sub) : null,
@@ -168,7 +182,15 @@ function card(id, title, stemClass, rows, opts = {}) {
       class: 'link',
       type: 'button',
       onClick: async () => {
-        await copy([...node.querySelectorAll('.rname')].map((n) => n.textContent).join('\n'));
+        const rows = [...node.querySelectorAll('.row-item')].filter(
+          (r) => !r.classList.contains('hidden-by-filter')
+        );
+        await copy(
+          rows
+            .map((r) => r.dataset.copy || r.querySelector('.rname')?.textContent || '')
+            .filter(Boolean)
+            .join('\n')
+        );
         button.textContent = 'copied';
         setTimeout(() => {
           button.textContent = 'copy';
@@ -444,6 +466,7 @@ function show(api) {
         return row(op.displayName, {
           pill: op.method,
           sub: op.urlTemplate,
+          copyText: `${op.method || ''} ${op.urlTemplate || ''}`.trim() + `  ${op.displayName}`,
           why: detail
             ? [
                 detail.namedValues?.length ? `${detail.namedValues.length} named value(s)` : null,

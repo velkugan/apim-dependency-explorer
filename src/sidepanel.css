@@ -361,3 +361,58 @@ label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px
   margin: 8px 0 4px;
 }
 .summary-line.clean { border-left-color: var(--c-namedvalue); }
+
+/* ---------- troubleshoot (Application Insights logs) ---------- */
+
+dialog.troubleshoot {
+  width: min(720px, 92vw);
+  max-height: 82vh;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+dialog.troubleshoot::backdrop { background: rgba(0, 0, 0, 0.55); }
+
+.ts-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.ts-head h3 { margin: 0; font-size: 13px; }
+.ts-head .ts-sub {
+  font: 400 11px var(--mono);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.ts-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-2);
+}
+.ts-field { flex: 0 0 auto; width: auto; min-width: 72px; }
+.ts-field-grow { flex: 1; }
+.ts-field select, .ts-field input { width: 100%; }
+
+.ts-body { padding: 10px 12px; overflow: auto; max-height: 56vh; }
+
+.ts-table { width: 100%; border-collapse: collapse; font: 400 11px var(--mono); }
+.ts-table th, .ts-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+  word-break: break-word;
+}
+.ts-table th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--surface); }
+.ts-table tr.ts-exception td { color: var(--c-issue); }

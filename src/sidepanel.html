@@ -77,6 +77,20 @@
       <button id="export" class="ghost small" type="button" title="Download everything resolved so far">Export</button>
     </section>
 
+    <section class="sweepbar" id="sweepbar" hidden>
+      <div class="row">
+        <button id="sweep-run" class="ghost small" type="button"
+          title="Resolve every API so dependencies can be looked up in reverse">Build index</button>
+        <button id="sweep-open" class="ghost small" type="button" hidden>Reverse lookup</button>
+        <button id="sweep-stop" class="ghost small" type="button" hidden>Stop</button>
+        <span id="sweep-age" class="sweep-age"></span>
+      </div>
+      <div id="sweep-progress" class="sweep-progress" hidden>
+        <div class="sweep-track"><i id="sweep-fill"></i></div>
+        <span id="sweep-detail" class="sweep-detail"></span>
+      </div>
+    </section>
+
     <main id="results" class="results">
       <p class="empty">Paste a token, point at an API Management instance, then fetch. Dependencies load per API, only when you expand one.</p>
     </main>

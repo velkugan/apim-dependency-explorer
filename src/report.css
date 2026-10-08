@@ -704,3 +704,146 @@ body.explorer-mode .report-title {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- reverse lookup ---------- */
+
+.reverse-root { display: none; padding: 14px 20px 50px; }
+body.reverse-mode .reverse-root { display: block; }
+body.reverse-mode .report-layout,
+body.reverse-mode .explorer-layout { display: none; }
+
+.rev-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 14px 0 6px;
+}
+
+.rev-tabs { display: flex; gap: 2px; flex-wrap: wrap; }
+
+.rev-tab {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  background: none;
+  border: 1px solid transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 5px 9px;
+  color: var(--muted);
+  font: 500 12px var(--sans);
+  cursor: pointer;
+}
+
+.rev-tab:hover { color: var(--text); }
+
+.rev-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--c-backend);
+}
+
+.rev-tab .n { font: 400 10.5px var(--mono); color: var(--faint); }
+
+.rev-search { width: 240px; margin-left: auto; }
+
+.rev-body { margin-top: 8px; }
+
+.rev-row {
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--c-backend);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin-bottom: 4px;
+}
+
+.rev-row > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.rev-row > summary::-webkit-details-marker { display: none; }
+.rev-row > summary::before {
+  content: '▸';
+  color: var(--faint);
+  font-size: 9px;
+  width: 9px;
+  flex: none;
+}
+.rev-row[open] > summary::before { content: '▾'; }
+.rev-row > summary:hover { background: var(--surface-2); }
+
+.rev-name {
+  font: 500 12.5px var(--mono);
+  word-break: break-all;
+}
+
+.rev-count {
+  margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font: 500 11.5px var(--mono);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.rev-split { font-weight: 400; color: var(--faint); font-size: 10.5px; }
+
+.rev-users {
+  border-top: 1px solid var(--line-soft);
+  padding: 4px 10px 8px 24px;
+}
+
+.rev-user {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+  flex-wrap: wrap;
+}
+
+.rev-api { font: 500 12px var(--sans); }
+.rev-path { font: 400 10.5px var(--mono); color: var(--faint); }
+.rev-via { font: 400 10.5px var(--mono); color: var(--muted); }
+
+/* ---------- tree compare status ---------- */
+
+.tstatus {
+  font: 500 9.5px var(--mono);
+  letter-spacing: 0.03em;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  white-space: nowrap;
+  flex: none;
+}
+
+/* A node's own verdict reads solid; a rolled-up one from a child is muted,
+   so the eye lands on the actual problem rather than the path to it. */
+.tstatus.inherited {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+.tstatus.s-missing { color: var(--c-issue); }
+.tstatus.s-broken { color: var(--c-issue); }
+.tstatus.s-unlinked { color: var(--c-product); }
+.tstatus.s-probable { color: var(--c-product); }
+.tstatus.s-differs { color: var(--muted); }
+.tstatus.s-present { color: var(--c-namedvalue); }
+
+.tnode[data-status='missing'] > details > summary,
+.tnode[data-status='broken'] > details > summary,
+.tnode[data-status='missing'] > .tnode-head,
+.tnode[data-status='broken'] > .tnode-head {
+  background: color-mix(in srgb, var(--c-issue) 7%, transparent);
+}
+
+.tnode-head {
+  flex-wrap: wrap;
+}

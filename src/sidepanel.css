@@ -385,6 +385,48 @@ dialog.troubleshoot::backdrop { background: rgba(0, 0, 0, 0.55); }
 .ts-head h3 { margin: 0; font-size: 13px; }
 .ts-head .ts-sub {
   font: 400 11px var(--mono);
+/* ---------- instance sweep ---------- */
+
+.sweepbar {
+  padding: 6px 12px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.sweepbar[hidden] { display: none; }
+.sweepbar .row { margin-top: 0; }
+
+.sweep-age {
+  margin-left: auto;
+  font: 400 10.5px var(--mono);
+  color: var(--faint);
+}
+
+.sweep-progress { margin-top: 6px; }
+
+.sweep-track {
+  height: 3px;
+  background: var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.sweep-track i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--c-backend);
+  transition: width 0.25s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sweep-track i { transition: none; }
+}
+
+.sweep-detail {
+  display: block;
+  margin-top: 4px;
+  font: 400 10.5px var(--mono);
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -416,3 +458,4 @@ dialog.troubleshoot::backdrop { background: rgba(0, 0, 0, 0.55); }
 }
 .ts-table th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--surface); }
 .ts-table tr.ts-exception td { color: var(--c-issue); }
+}

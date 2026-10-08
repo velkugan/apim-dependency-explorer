@@ -122,11 +122,17 @@ node tools/test-analyzer.mjs
 - **Nothing is called missing without a direct GET.** If a reference is absent from the
   list response, the resolver confirms with a single memoised lookup before flagging it,
   covering stale or filtered list responses.
-- **Dynamic backend ids are expanded.** `backend-id="@("wem-st" + context.Variables["site"])"`
-  is recognised as dynamic; string literals are mined out of the expression and matched
-  against the catalog, so you see `wem-st, wem-st01` rather than a false missing backend.
-  `{{some-named-value}}` alone resolves through the named value when it holds a plain
-  string.
+- **Dynamic backend ids are expanded.** A `backend-id` built at runtime —
+  `@("wem-" + context.Variables["site"])`, `{{prefix}}-{{suffix}}`, a dictionary lookup,
+  or a name assembled in an earlier `set-variable` — is recognised as dynamic. Every
+  piece of literal evidence (expression string literals, literal runs in the id, the
+  `set-variable` that built the name, named value values) is matched against the
+  catalog and the union is kept; evidence matching nothing contributes nothing, so the
+  catalog itself decides what was a real clue. Short clues require a name-segment
+  boundary so `WA` does not match `urm-gateway`. When every `{{token}}` resolves, the id
+  is substituted whole and looked up exactly. When nothing resolves it, the route is
+  flagged **dynamic · review** rather than passing silently, and the target comparison
+  reports it as needing a manual check.
 
 ## Comparing against a target environment
 
@@ -156,6 +162,29 @@ differ per environment.
 If a target list call fails, those checks are skipped and reported as skipped, never as
 false gaps.
 
+## Reverse lookup
+
+Everything else here is lazy: expand one API and it resolves that one. Reverse lookup
+cannot work that way, so it is the one deliberately expensive operation.
+
+**Build index** under the API list sweeps every API and inverts the result into a
+dependency-to-APIs index. The sweep is paced by a token bucket matching ARM's own
+throttling model (bucket 250, refill 25/sec for subscription reads) and deliberately
+spends only a fraction of it, because it runs under your own identity and would
+otherwise throttle your portal session. It reads
+`x-ms-ratelimit-remaining-subscription-reads` off each response, can be stopped and
+resumed, survives a token expiring mid-sweep, and persists with its age shown.
+
+**Reverse lookup** then opens the report window on an index of backends, named values,
+fragments, products, certificates, Key Vault secrets and loggers. Each entry lists the
+APIs using it, split into direct and indirect:
+
+    logstash-url — 3 APIs · 1 direct · 2 via fragment or product
+
+A dynamic backend counts every candidate it could select at runtime. A **Needs
+attention** panel lists expiring certificates and failing Key Vault refreshes with the
+APIs affected.
+
 ## The report window
 
 **Report** in the toolbar, or **Open report** on an expanded API, opens a detached window
@@ -166,7 +195,11 @@ resolved APIs alphabetically. Three views, cycled with one button:
   one filter box searching every category at once. Print-friendly.
 - **Tree** — each policy document as a branch holding only what it references directly,
   so you can see which fragment brought a named value in. Nested fragments expand in
-  place with cycle guards.
+  place with cycle guards. With a target configured every node carries its target
+  verdict, and the worst status rolls up the branch: a fragment that is itself fine but
+  contains a missing named value shows a muted roll-up badge and auto-expands, so you
+  can see *where in the dependency chain* a gap lives before expanding anything. **Only
+  gaps** prunes every clean subtree.
 - **Explorer** — selectable tree on the left, detail on the right. With a target set, the
   detail splits Source | Target.
 
@@ -234,6 +267,7 @@ src/lib/apim.js              APIM endpoints, resource-ID parsing, service discov
 src/lib/policy-analyzer.js   the named value / variable / Liquid classifier
 src/lib/resolver.js          catalog load, per-API resolution, scope graph
 src/lib/appinsights.js       Troubleshoot: recent App Insights logs via the ARM proxy
+src/lib/sweep.js             instance-wide sweep and reverse dependency index
 src/lib/compare.js           target indexing and gap comparison
 src/lib/diff.js              XML normalisation and line diff
 src/lib/arm-templates.js     ARM template generation
@@ -292,10 +326,13 @@ explanation and both calls.
   restart reports as expired rather than showing stale data.
 - The default ARM API version is `2022-08-01`; policy fragments need `2021-12-01-preview`
   or later, so leave it at the default or newer.
+- The reverse-lookup index is a point-in-time sweep. Nothing invalidates it
+  automatically — APIM offers no cheap "what changed since" across APIs — so its age is
+  shown and rebuilding is manual.
 
 ## Not yet built
 
-Discussed and deliberately deferred: reverse lookup ("what breaks if I change this named
-value"), orphan detection, certificate and secret expiry sweeps, a configurable rule
-engine for naming standards and mandatory fragments / rate limiting, and a headless CI
-gate reusing `policy-analyzer.js` and `resolver.js`.
+Discussed and deliberately deferred: orphan detection (`findOrphans` exists in
+`sweep.js` but has no UI yet), a configurable rule engine for naming standards and
+mandatory fragments / rate limiting, pushing generated ARM templates straight to a
+DevOps repo, and a headless CI gate reusing `policy-analyzer.js` and `resolver.js`.

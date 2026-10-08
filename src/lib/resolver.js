@@ -204,7 +204,7 @@ function parseSecretIdentifier(secretIdentifier) {
  * catalog by whatever is literal in the expression rather than reporting the
  * whole string as a missing backend.
  */
-function resolveDynamicBackend(catalog, entry) {
+function resolveDynamicBackend(catalog, entry, context = {}) {
   // {{some-named-value}} on its own is not really dynamic: if the named value
   // holds a plain string, that string is the backend id.
   if (entry.wholeToken) {
@@ -215,37 +215,133 @@ function resolveDynamicBackend(catalog, entry) {
       if (direct.item) {
         return {
           resolvedVia: `named value “${entry.wholeToken}” = ${value}`,
+          confident: true,
           candidates: [{ name: direct.item.name, backend: direct.item }]
         };
       }
     }
   }
 
+  // Gather every scrap of literal evidence, from strongest to weakest:
+  //  - literals in the expression itself ("wem-" + ...)
+  //  - literal runs around the masked parts ("{{env}}01" -> "01")
+  //  - literals from the set-variable that built the id, when it only
+  //    references a variable here
+  //  - values of the named values the id is assembled from
+  const evidence = new Map();
+  const addEvidence = (text, source, weight) => {
+    const key = String(text || '').toLowerCase();
+    if (key.length < 2) return;
+    const existing = evidence.get(key);
+    if (!existing || existing.weight < weight) evidence.set(key, { text, source, weight });
+  };
+
+  for (const hint of entry.hints || []) addEvidence(hint, 'expression literal', 3);
+  for (const segment of entry.segments || []) addEvidence(segment, 'literal in the id', 3);
+
+  for (const variable of entry.variableRefs || []) {
+    const written = context.variablesWritten?.get(variable);
+    for (const literal of written?.literals || []) {
+      addEvidence(literal, `set-variable “${variable}”`, 2);
+    }
+  }
+
+  for (const token of entry.namedValueRefs || []) {
+    const nv = catalog.namedValueByToken.get(token);
+    const value = nv?.properties?.secret ? null : nv?.properties?.value;
+    if (value) addEvidence(value, `named value “${token}”`, 2);
+  }
+
   const prefix = (entry.prefix || '').toLowerCase();
   const suffix = (entry.suffix || '').toLowerCase();
-  const hint = (entry.hints || [])[0]?.toLowerCase() || '';
 
-  const candidates = [];
-  for (const [name, backend] of catalog.backends) {
-    const lower = name.toLowerCase();
-    if (prefix && !lower.startsWith(prefix)) continue;
-    if (suffix && !lower.endsWith(suffix)) continue;
-    if (hint && !lower.includes(hint)) continue;
-    if (!prefix && !suffix && !hint) continue; // too vague to guess; leave empty
-    candidates.push({ name, backend });
+  // When every {{token}} in the id resolves to a known named value, the whole
+  // name can be substituted and looked up exactly — no guessing required.
+  if ((entry.namedValueRefs || []).length && !(entry.hints || []).length) {
+    let substituted = entry.raw;
+    let complete = true;
+    for (const token of entry.namedValueRefs) {
+      const nv = catalog.namedValueByToken.get(token);
+      const value = nv?.properties?.secret ? null : nv?.properties?.value;
+      if (value === undefined || value === null) {
+        complete = false;
+        break;
+      }
+      substituted = substituted.split(`{{${token}}}`).join(value);
+    }
+    if (complete && !/[{}@]/.test(substituted)) {
+      const exact = lookupCatalog(catalog, 'backends', substituted);
+      if (exact.item) {
+        return {
+          resolvedVia: `named values substitute to “${substituted}”`,
+          confident: true,
+          candidates: [{ name: exact.item.name, backend: exact.item, because: ['exact substitution'] }]
+        };
+      }
+    }
   }
-  candidates.sort((a, b) => a.name.localeCompare(b.name));
 
-  const describe = [
-    prefix && `prefix “${prefix}”`,
-    suffix && `suffix “${suffix}”`,
-    hint && `literal “${hint}”`
-  ]
-    .filter(Boolean)
-    .join(', ');
+  /**
+   * Short clues need a boundary, not a bare substring: "WA" appearing inside
+   * "urm-gateway" is a coincidence, while "wem" starting "wem-st01" is not.
+   */
+  const matchesName = (lowerName, needle) => {
+    if (needle.length >= 4) return lowerName.includes(needle);
+    return lowerName
+      .split(/[-_.]/)
+      .some((part) => part === needle || part.startsWith(needle));
+  };
+
+  // Match every piece of evidence against the catalog and keep the union.
+  // Evidence that matches nothing (a variable name, a header name, a region
+  // code) simply contributes nothing, so no heuristic filtering is needed —
+  // the catalog itself decides what was a real clue.
+  const matched = new Map();
+  for (const [, { text, source }] of evidence) {
+    const needle = text.toLowerCase();
+    for (const [name, backend] of catalog.backends) {
+      const lower = name.toLowerCase();
+      if (!matchesName(lower, needle)) continue;
+      if (prefix && !lower.startsWith(prefix)) continue;
+      if (suffix && !lower.endsWith(suffix)) continue;
+      if (!matched.has(name)) matched.set(name, { name, backend, because: [] });
+      matched.get(name).because.push(`${source} “${text}”`);
+    }
+  }
+
+  // Prefix or suffix alone can still narrow it when no literal matched.
+  if (!matched.size && (prefix || suffix)) {
+    for (const [name, backend] of catalog.backends) {
+      const lower = name.toLowerCase();
+      if (prefix && !lower.startsWith(prefix)) continue;
+      if (suffix && !lower.endsWith(suffix)) continue;
+      matched.set(name, { name, backend, because: [prefix ? `prefix “${prefix}”` : `suffix “${suffix}”`] });
+    }
+  }
+
+  const candidates = [...matched.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const clues = [...evidence.values()].map((e) => e.text);
+
+  // A single weak clue matching most of the catalog is not a resolution, it is
+  // a coincidence. Say so rather than presenting 80 backends as dependencies.
+  const tooBroad = candidates.length > 12 && candidates.length > catalog.backends.size * 0.4;
+
+  if (!candidates.length || tooBroad) {
+    return {
+      resolvedVia: clues.length
+        ? tooBroad
+          ? `clues ${clues.map((c) => `“${c}”`).join(', ')} match ${candidates.length} backends — too broad to be useful`
+          : `no backend matches ${clues.map((c) => `“${c}”`).join(', ')}`
+        : 'built at runtime with no literal part to match on',
+      confident: false,
+      needsReview: true,
+      candidates: tooBroad ? [] : candidates
+    };
+  }
 
   return {
-    resolvedVia: describe ? `matched on ${describe}` : 'no literal part to match on',
+    resolvedVia: `matched on ${[...new Set(candidates.flatMap((c) => c.because))].slice(0, 3).join(', ')}`,
+    confident: true,
     candidates
   };
 }
@@ -444,7 +540,9 @@ export async function resolveApi(svc, catalog, api, opts = {}, onProgress = () =
   const backends = [];
   for (const [id, entry] of merged.backends) {
     if (entry.dynamic) {
-      const resolvedDynamic = resolveDynamicBackend(catalog, entry);
+      const resolvedDynamic = resolveDynamicBackend(catalog, entry, {
+        variablesWritten: merged.variablesWritten
+      });
       for (const candidate of resolvedDynamic.candidates) {
         const credentials = candidate.backend?.properties?.credentials;
         if (credentials) {
@@ -459,11 +557,13 @@ export async function resolveApi(svc, catalog, api, opts = {}, onProgress = () =
         pattern: entry.pattern,
         hints: entry.hints || [],
         resolvedVia: resolvedDynamic.resolvedVia,
+        needsReview: !!resolvedDynamic.needsReview,
         exists: resolvedDynamic.candidates.length > 0,
         candidates: resolvedDynamic.candidates.map((c) => ({
           id: c.name,
           url: c.backend?.properties?.url || null,
-          title: c.backend?.properties?.title || null
+          title: c.backend?.properties?.title || null,
+          because: c.because || []
         })),
         usedIn: entry.occurrences
       });

@@ -267,8 +267,10 @@ export async function compareApi(targetSvc, index, resolved, options = {}) {
         add({
           kind: 'backend (dynamic)',
           name: backend.id,
-          verdict: 'differs',
-          detail: 'built at runtime with no literal part to match on — check this one by hand'
+          verdict: 'broken',
+          detail:
+            `${backend.resolvedVia || 'built at runtime'} — this route cannot be verified ` +
+            'automatically, so check the target by hand'
         });
         continue;
       }

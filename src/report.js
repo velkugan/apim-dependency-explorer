@@ -4,6 +4,14 @@ import { ArmClient } from './lib/arm.js';
 import { ApimService } from './lib/apim.js';
 import { normalizeXml, diffLines, collapseUnchanged, diffStats, diffFields } from './lib/diff.js';
 import { buildTemplateBundle } from './lib/arm-templates.js';
+import {
+  queryIndex,
+  findExpiringOrBroken,
+  sweepToText,
+  sweepAge,
+  kindLabel,
+  INDEX_KINDS
+} from './lib/sweep.js';
 import { makeZip, downloadBlob } from './lib/zip.js';
 
 const params = new URLSearchParams(location.search);
@@ -18,6 +26,8 @@ const els = {
   nav: $('#nav'),
   main: $('#main'),
   filter: $('#filter'),
+  reverseRoot: $('#reverse-root'),
+  treeGaps: $('#tree-gaps'),
   explorerTree: $('#explorer-tree'),
   detail: $('#detail'),
   copyList: $('#copy-list'),
@@ -38,7 +48,34 @@ async function boot() {
     return fail(`Could not read the report: ${err.message}`);
   }
   const payload = stored?.[payloadKey];
-  if (!payload?.apis?.length) return fail('That report has expired. Re-open it from the side panel.');
+  if (!payload) return fail('That report has expired. Re-open it from the side panel.');
+
+  // Reverse lookup carries a sweep instead of resolved APIs, so it takes a
+  // different path through boot entirely.
+  if (payload.mode === 'reverse') {
+    state.payload = payload;
+    document.title = `Reverse lookup — ${payload.sweep?.serviceName || 'APIM'}`;
+    document.body.classList.add('reverse-mode');
+    els.picker.hidden = true;
+    els.copyList.addEventListener('click', () =>
+      copyWith(els.copyList, () =>
+        sweepToText(
+          payload.sweep,
+          queryIndex(payload.sweep, { kind: reverse.kind, term: reverse.term }),
+          reverse.kind
+        )
+      )
+    );
+    els.copyJson.addEventListener('click', () =>
+      copyWith(els.copyJson, () => JSON.stringify(payload.sweep, null, 2))
+    );
+    els.print.addEventListener('click', () => window.print());
+    els.filter.hidden = true;
+    renderReverse();
+    return;
+  }
+
+  if (!payload.apis?.length) return fail('That report has expired. Re-open it from the side panel.');
 
   state.payload = payload;
   document.title = `${payload.service?.serviceName || 'APIM'} dependencies`;
@@ -73,6 +110,10 @@ async function boot() {
     copyWith(els.copyGaps, () => comparisonToText(state.current.comparison, state.current.apiLabel))
   );
   els.genTemplates.addEventListener('click', generateTemplates);
+  els.treeGaps.addEventListener('click', () => {
+    treeView.onlyGaps = !treeView.onlyGaps;
+    renderTree();
+  });
 
   els.viewToggle = h(
     'button',
@@ -263,13 +304,15 @@ function show(api) {
       api.backends.map((b) =>
         b.dynamic
           ? row(b.id, {
-              missing: !b.exists,
-              pill: 'dynamic',
-              pillColor: 'var(--c-product)',
+              missing: b.needsReview,
+              pill: b.needsReview ? 'dynamic · review' : 'dynamic',
+              pillColor: b.needsReview ? 'var(--c-issue)' : 'var(--c-product)',
               sub: b.candidates?.length
                 ? b.candidates.map((c) => `${c.id}${c.url ? ` → ${c.url}` : ''}`).join('\n')
-                : 'built at runtime, no matching backend found',
-              why: `${b.resolvedVia} · any of these can be selected at runtime`,
+                : 'could not be resolved to a backend — check this route by hand',
+              why: b.needsReview
+                ? b.resolvedVia
+                : `${b.resolvedVia} · any of these can be selected at runtime`,
               refs: b.usedIn
             })
           : row(b.id, {
@@ -524,9 +567,7 @@ function show(api) {
   }
   els.main.replaceChildren(top, columns, wide);
   if (state.view === 'explorer') renderExplorer();
-  if (document.body.classList.contains('tree-mode')) {
-    els.main.append(h('div', { id: 'tree-root', class: 'tree-root' }, buildTree(api)));
-  }
+  if (document.body.classList.contains('tree-mode')) renderTree();
 
   renderNav();
   applyFilter();
@@ -659,100 +700,246 @@ const KIND_CLASS = {
   missing: 'g-issue'
 };
 
-function treeNode({ label, kind, detail, children, open }) {
-  const cls = KIND_CLASS[kind] || 'g-plain';
+/**
+ * Severity ordering shared by the tree roll-up. Lower is worse, so Math.min
+ * over a branch's children gives the worst thing anywhere beneath it.
+ */
+const STATUS_RANK = {
+  missing: 0,
+  broken: 1,
+  unlinked: 2,
+  probable: 3,
+  differs: 4,
+  present: 5,
+  unknown: 6
+};
+
+const STATUS_LABEL = {
+  missing: 'missing in target',
+  broken: 'broken in target',
+  unlinked: 'not linked in target',
+  probable: 'name differs',
+  differs: 'differs',
+  present: 'matches'
+};
+
+const STATUS_SHORT = {
+  missing: 'missing',
+  broken: 'broken',
+  unlinked: 'unlinked',
+  probable: '≈',
+  differs: 'differs',
+  present: '✓'
+};
+
+/** Comparison kinds as compare.js emits them, mapped to tree node kinds. */
+const COMPARE_KIND_FOR = {
+  fragment: 'policy fragment',
+  backend: 'backend',
+  'named value': 'named value',
+  certificate: 'certificate',
+  logger: 'logger',
+  product: 'product',
+  'version set': 'version set'
+};
+
+/**
+ * Index the comparison by kind and name so a tree node can ask "what happened
+ * to me in the target" in constant time. Dynamic backends are indexed under
+ * both the raw expression and each candidate, since the tree shows the
+ * expression while the comparison keys on it too.
+ */
+function buildCompareLookup(comparison) {
+  const byKind = new Map();
+  if (!comparison) return byKind;
+
+  for (const item of comparison.items || []) {
+    const kind = item.kind.startsWith('backend') ? 'backend' : item.kind;
+    if (!byKind.has(kind)) byKind.set(kind, new Map());
+    byKind.get(kind).set(String(item.name).toLowerCase(), item);
+  }
+  return byKind;
+}
+
+function lookupStatus(lookup, treeKind, name) {
+  const compareKind = COMPARE_KIND_FOR[treeKind];
+  if (!compareKind || !name) return null;
+  const item = lookup.get(compareKind)?.get(String(name).toLowerCase());
+  if (!item) return null;
+  return { status: item.verdict, detail: item.detail || null, targetName: item.targetName || null };
+}
+
+/** Renders one node from the model, carrying its own and its rolled-up status. */
+function renderTreeNode(model) {
+  const cls = KIND_CLASS[model.kind] || 'g-plain';
+  const own = model.status;
+  const rolled = model.rollup;
+
+  // A branch that is itself fine but hides a problem gets a muted roll-up
+  // badge, so you can see where to dig without expanding everything.
+  const inherited = !own && rolled && rolled !== 'present' && STATUS_RANK[rolled] < STATUS_RANK.present;
+
+  const badges = [];
+  if (own && own !== 'unknown') {
+    badges.push(
+      h('span', { class: `tstatus s-${own}`, title: model.statusDetail || STATUS_LABEL[own] }, STATUS_SHORT[own])
+    );
+  }
+  if (inherited) {
+    badges.push(
+      h(
+        'span',
+        { class: `tstatus s-${rolled} inherited`, title: `contains something ${STATUS_LABEL[rolled]}` },
+        `▾ ${STATUS_SHORT[rolled]}`
+      )
+    );
+  }
+
   const head = h(
     'span',
     { class: 'tnode-head' },
-    h('span', { class: 'tkind' }, kind),
-    h('span', { class: 'tlabel' }, label),
-    detail ? h('span', { class: 'tdetail' }, detail) : null
+    h('span', { class: 'tkind' }, model.kind),
+    h('span', { class: 'tlabel' }, model.label),
+    model.detail ? h('span', { class: 'tdetail' }, model.detail) : null,
+    ...badges
   );
 
-  if (!children || !children.length) {
-    return h('li', { class: `tnode ${cls}` }, head);
+  const children = model.children || [];
+  if (!children.length) {
+    return h('li', { class: `tnode ${cls}`, dataset: { status: rolled || 'unknown' } }, head);
   }
   return h(
     'li',
-    { class: `tnode ${cls}` },
+    { class: `tnode ${cls}`, dataset: { status: rolled || 'unknown' } },
     h(
       'details',
-      open ? { open: true } : null,
+      // Auto-open the path to a problem so it is visible without hunting.
+      model.open || inherited ? { open: true } : null,
       h('summary', null, head, h('span', { class: 'tcount' }, `${children.length}`)),
-      h('ul', null, ...children)
+      h('ul', null, ...children.map(renderTreeNode))
     )
   );
 }
 
+/** Bottom-up worst-status roll-up. */
+function rollupTree(model) {
+  let worst = model.status && STATUS_RANK[model.status] !== undefined ? model.status : 'unknown';
+  for (const child of model.children || []) {
+    const childWorst = rollupTree(child);
+    if (STATUS_RANK[childWorst] < STATUS_RANK[worst]) worst = childWorst;
+  }
+  model.rollup = worst;
+  return worst;
+}
+
+/** Drops subtrees that contain nothing worse than "present". */
+function pruneClean(model) {
+  if (!model.children?.length) {
+    return model.rollup !== undefined && STATUS_RANK[model.rollup] < STATUS_RANK.present;
+  }
+  model.children = model.children.filter(pruneClean);
+  return (
+    model.children.length > 0 ||
+    (model.status && STATUS_RANK[model.status] < STATUS_RANK.present)
+  );
+}
+
 /**
- * Builds the tree from the per-scope reference lists: each policy document is a
- * branch holding only what it references directly, and a fragment branch expands
- * into that fragment's own document.
+ * Builds the tree model from the per-scope reference lists: each policy
+ * document is a branch holding only what it references directly, and a
+ * fragment branch expands into that fragment's own document.
+ *
+ * When a target comparison is present, every node is annotated with what
+ * happened to it in the target and the worst status is rolled up the branch.
  */
-function buildTree(api) {
+function buildTreeModel(api) {
   const scopes = api.scopes || [];
+  const lookup = buildCompareLookup(api.comparison);
+
   const scopeByFragment = new Map();
   for (const scope of scopes) {
     if (scope.type === 'fragment') {
-      const id = scope.scope.replace(/^fragment:/, '');
-      scopeByFragment.set(id.toLowerCase(), scope);
+      scopeByFragment.set(scope.scope.replace(/^fragment:/, '').toLowerCase(), scope);
     }
   }
   const fragmentMeta = new Map((api.fragments || []).map((f) => [f.id.toLowerCase(), f]));
   const backendMeta = new Map((api.backends || []).map((b) => [String(b.id).toLowerCase(), b]));
   const nvMeta = new Map((api.namedValues || []).map((n) => [n.token.toLowerCase(), n]));
 
+  const node = (label, kind, detail, extra = {}) => {
+    const found = lookupStatus(lookup, kind, extra.compareName ?? label);
+    return {
+      label,
+      kind,
+      detail,
+      children: extra.children || [],
+      open: extra.open,
+      status: extra.status ?? found?.status ?? null,
+      statusDetail: found?.detail || extra.statusDetail || null
+    };
+  };
+
   const leaves = (scope, seen) => {
     const out = [];
+
     for (const id of scope.fragments) {
       const key = id.toLowerCase();
       const meta = fragmentMeta.get(key);
       if (seen.has(key)) {
-        out.push(treeNode({ label: id, kind: 'fragment', detail: 'already expanded above' }));
+        out.push(node(id, 'fragment', 'already expanded above'));
         continue;
       }
       const child = scopeByFragment.get(key);
       const nextSeen = new Set(seen).add(key);
       out.push(
-        treeNode({
-          label: id,
-          kind: meta && !meta.exists ? 'missing' : 'fragment',
-          detail: meta?.exists === false ? 'not defined' : meta?.description || null,
-          children: child ? leaves(child, nextSeen) : []
+        node(id, meta && !meta.exists ? 'missing' : 'fragment', meta?.exists === false ? 'not defined' : meta?.description || null, {
+          children: child ? leaves(child, nextSeen) : [],
+          compareName: id
         })
       );
     }
+
     for (const entry of scope.backendEntries || scope.backends.map((k) => ({ key: k }))) {
-      const meta = backendMeta.get(String(entry.raw || entry.key).toLowerCase());
+      const raw = entry.raw || entry.key;
+      const meta = backendMeta.get(String(raw).toLowerCase());
+      if (meta?.dynamic && meta.candidates?.length) {
+        // Each candidate is independently present or missing in the target, so
+        // they become children rather than a flattened detail string.
+        out.push(
+          node(raw, 'backend', `dynamic · ${meta.candidates.length} possible`, {
+            compareName: raw,
+            children: meta.candidates.map((c) =>
+              node(c.id, 'backend', c.url || null, { compareName: c.id })
+            )
+          })
+        );
+        continue;
+      }
       out.push(
-        treeNode({
-          label: entry.raw || entry.key,
-          kind: meta && !meta.exists ? 'missing' : 'backend',
-          detail: meta?.dynamic
-            ? `dynamic → ${meta.candidates?.map((c) => c.id).join(', ') || 'no match'}`
-            : meta?.url || null
-        })
+        node(raw, meta && !meta.exists ? 'missing' : 'backend',
+          meta?.dynamic ? 'dynamic → no match' : meta?.url || null,
+          { compareName: raw })
       );
     }
+
     for (const token of scope.namedValues) {
       const meta = nvMeta.get(token.toLowerCase());
       out.push(
-        treeNode({
-          label: token,
-          kind: meta && !meta.exists ? 'missing' : 'named value',
-          detail: meta?.keyVault
+        node(token, meta && !meta.exists ? 'missing' : 'named value',
+          meta?.keyVault
             ? `key vault ${meta.keyVault.vaultName}/${meta.keyVault.secretName}`
             : meta?.secret
             ? 'secret'
-            : meta?.value ?? null
-        })
+            : meta?.value ?? null,
+          { compareName: token })
       );
     }
-    for (const id of scope.certificates) out.push(treeNode({ label: id, kind: 'certificate' }));
-    for (const id of scope.loggers) out.push(treeNode({ label: id, kind: 'logger' }));
-    for (const url of scope.urls) out.push(treeNode({ label: url, kind: 'url' }));
+
+    for (const id of scope.certificates) out.push(node(id, 'certificate', null));
+    for (const id of scope.loggers) out.push(node(id, 'logger', null));
+    for (const url of scope.urls) out.push(node(url, 'url', null));
     for (const name of scope.unresolved) {
-      out.push(treeNode({ label: `{{${name}}}`, kind: 'missing', detail: 'named value not defined' }));
+      out.push(node(`{{${name}}}`, 'missing', 'named value not defined', { status: 'missing' }));
     }
     return out;
   };
@@ -762,28 +949,53 @@ function buildTree(api) {
     if (scope.type === 'fragment') continue; // reached through whoever includes it
     const children = leaves(scope, new Set());
     if (!children.length && !scope.hasPolicy) continue;
+    const kind =
+      scope.type === 'product' ? 'product' : scope.type === 'operation' ? 'operation' : 'policy';
     branches.push(
-      treeNode({
-        label: scope.label,
-        kind: scope.type === 'product' ? 'product' : scope.type === 'operation' ? 'operation' : 'policy',
-        detail: scope.hasPolicy ? null : 'no policy',
+      node(scope.label, kind, scope.hasPolicy ? null : 'no policy', {
         children,
-        open: scope.type === 'api'
+        open: scope.type === 'api',
+        // The branch is labelled with the product's display name, but the
+        // comparison keys on its resource id, which only the scope carries.
+        compareName:
+          scope.type === 'product' ? scope.scope.replace(/^product:/, '') : null
       })
     );
   }
 
-  return h(
-    'ul',
-    { class: 'tree' },
-    treeNode({
-      label: api.apiLabel,
-      kind: 'policy',
-      detail: `/${api.path || ''}`,
-      children: branches,
-      open: true
-    })
+  const root = node(api.apiLabel, 'policy', `/${api.path || ''}`, { children: branches, open: true });
+  rollupTree(root);
+  return root;
+}
+
+const treeView = { onlyGaps: false };
+
+/** Rebuilds the tree in place; used on API switch and on the gaps toggle. */
+function renderTree() {
+  const existing = $('#tree-root');
+  const node = h(
+    'div',
+    { id: 'tree-root', class: 'tree-root' },
+    buildTree(state.current, { onlyGaps: treeView.onlyGaps })
   );
+  if (existing) existing.replaceWith(node);
+  else els.main.append(node);
+
+  // The toggle is only meaningful once there is a target to compare against.
+  const comparable = !!state.current?.comparison;
+  els.treeGaps.hidden = !(comparable && state.view === 'tree');
+  els.treeGaps.textContent = treeView.onlyGaps ? 'Show all' : 'Only gaps';
+}
+
+function buildTree(api, { onlyGaps = false } = {}) {
+  const model = buildTreeModel(api);
+  if (onlyGaps) {
+    pruneClean(model);
+    if (!model.children.length) {
+      return h('p', { class: 'note' }, 'Every dependency in this tree matches the target.');
+    }
+  }
+  return h('ul', { class: 'tree' }, renderTreeNode(model));
 }
 
 const VIEWS = ['cards', 'tree', 'explorer'];
@@ -800,9 +1012,8 @@ function setView(view) {
   document.body.classList.toggle('explorer-mode', view === 'explorer');
   els.viewToggle.textContent = NEXT_LABEL[view];
 
-  if (view === 'tree' && !$('#tree-root')) {
-    els.main.append(h('div', { id: 'tree-root', class: 'tree-root' }, buildTree(state.current)));
-  }
+  if (view === 'tree') renderTree();
+  els.treeGaps.hidden = !(view === 'tree' && state.current?.comparison);
   if (view === 'explorer') renderExplorer();
 }
 
@@ -1460,6 +1671,163 @@ async function generateTemplates() {
 }
 
 const safeName = (value) => String(value || 'apim').replace(/[^A-Za-z0-9._-]+/g, '-');
+
+
+// ---------------------------------------------------------------------------
+// reverse lookup view
+// ---------------------------------------------------------------------------
+
+const reverse = { kind: 'backends', term: '' };
+
+function renderReverse() {
+  const sweep = state.payload?.sweep;
+  if (!sweep) return;
+
+  const rows = queryIndex(sweep, { kind: reverse.kind, term: reverse.term });
+  const alerts = findExpiringOrBroken(sweep);
+
+  els.title.textContent = `Reverse lookup — ${sweep.serviceName}`;
+  els.meta.textContent =
+    `${sweep.apis.length} APIs indexed ${sweepAge(sweep)}` +
+    (sweep.complete === false ? ' · partial index' : '') +
+    (sweep.includeOperations ? '' : ' · operation policies skipped') +
+    (sweep.failures?.length ? ` · ${sweep.failures.length} failed` : '');
+
+  // Kind switcher doubles as a count summary.
+  const tabs = h('div', { class: 'rev-tabs' });
+  for (const kind of INDEX_KINDS) {
+    const count = queryIndex(sweep, { kind }).length;
+    if (!count) continue;
+    tabs.append(
+      h(
+        'button',
+        {
+          type: 'button',
+          class: `rev-tab${kind === reverse.kind ? ' active' : ''}`,
+          onClick: () => {
+            reverse.kind = kind;
+            renderReverse();
+          }
+        },
+        `${kindLabel(kind)}s`,
+        h('span', { class: 'n' }, String(count))
+      )
+    );
+  }
+
+  const search = h('input', {
+    type: 'search',
+    class: 'rev-search',
+    placeholder: `Filter ${kindLabel(reverse.kind)}s`,
+    value: reverse.term,
+    onInput: (event) => {
+      reverse.term = event.target.value;
+      renderRows();
+    }
+  });
+
+  const body = h('div', { class: 'rev-body' });
+
+  const renderRows = () => {
+    const filtered = queryIndex(sweep, { kind: reverse.kind, term: reverse.term });
+    body.replaceChildren(
+      ...filtered.map((row) => {
+        const flags = [];
+        if (row.flags.missing) flags.push(h('span', { class: 'pill', style: 'color:var(--c-issue)' }, 'missing'));
+        if (row.flags.keyVault) flags.push(h('span', { class: 'pill', style: 'color:var(--c-vault)' }, 'key vault'));
+        else if (row.flags.secret) flags.push(h('span', { class: 'pill' }, 'secret'));
+        if (row.flags.refreshStatus) {
+          flags.push(h('span', { class: 'pill', style: 'color:var(--c-issue)' }, row.flags.refreshStatus));
+        }
+
+        // The headline number is how many APIs break if this changes.
+        return h(
+          'details',
+          { class: 'rev-row' },
+          h(
+            'summary',
+            null,
+            h('span', { class: 'rev-name' }, row.id),
+            ...flags,
+            h(
+              'span',
+              { class: 'rev-count' },
+              `${row.userCount} API${row.userCount === 1 ? '' : 's'}`,
+              row.indirectCount
+                ? h('span', { class: 'rev-split' }, `${row.directCount} direct · ${row.indirectCount} via fragment or product`)
+                : null
+            )
+          ),
+          h(
+            'div',
+            { class: 'rev-users' },
+            ...row.users.map((user) =>
+              h(
+                'div',
+                { class: 'rev-user' },
+                h('span', { class: 'rev-api' }, user.apiLabel),
+                h('span', { class: 'rev-path' }, `/${user.path || ''}`),
+                user.via.length ? h('span', { class: 'rev-via' }, `via ${user.via.join(', ')}`) : null,
+                user.dynamic
+                  ? h('span', { class: 'pill', style: 'color:var(--c-product)' }, 'dynamic')
+                  : null
+              )
+            )
+          )
+        );
+      })
+    );
+    if (!filtered.length) {
+      body.replaceChildren(h('p', { class: 'note' }, 'Nothing matches that filter.'));
+    }
+  };
+
+  const alertBox = alerts.length
+    ? h(
+        'section',
+        { class: 'card g-issue wide' },
+        h(
+          'header',
+          null,
+          h('h2', null, 'Needs attention'),
+          h('span', { class: 'count' }, String(alerts.length))
+        ),
+        h(
+          'div',
+          { class: 'rows' },
+          ...alerts.map((alert) =>
+            h(
+              'div',
+              { class: `row-item${alert.severity === 'soon' ? '' : ' missing'}` },
+              h('span', { class: 'rname' }, `${alert.kind} ${alert.id}`),
+              h('span', { class: 'pill' }, alert.severity),
+              h('span', { class: 'rsub' }, alert.detail),
+              h(
+                'span',
+                { class: 'rwhy' },
+                `affects ${alert.users.length} API(s): ${alert.users.map((u) => u.apiLabel).join(', ')}`
+              )
+            )
+          )
+        )
+      )
+    : null;
+
+  const orphanNote = h(
+    'p',
+    { class: 'note' },
+    'Counts include references reached through products and policy fragments, not just the API policy. ' +
+      'A dynamic backend id counts every candidate it could select at runtime.'
+  );
+
+  els.reverseRoot.replaceChildren(
+    ...(alertBox ? [alertBox] : []),
+    h('div', { class: 'rev-controls' }, tabs, search),
+    orphanNote,
+    body
+  );
+  renderRows();
+}
 
 function renderNav() {
   els.nav.replaceChildren(

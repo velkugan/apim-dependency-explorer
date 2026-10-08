@@ -265,6 +265,17 @@ export function classifyToken(rawToken, { inExpression, inLiquid, knownNamedValu
  * This turns the value into a glob so the resolver can find every backend it
  * could select.
  */
+/** String literals inside an expression, longest first. */
+export function literalsIn(text) {
+  const out = [];
+  if (!text) return out;
+  for (const match of text.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'/g)) {
+    const literal = (match[1] ?? match[2] ?? '').trim();
+    if (literal.length >= 2 && /[a-z0-9]/i.test(literal)) out.push(literal);
+  }
+  return out.sort((a, b) => b.length - a.length);
+}
+
 export function dynamicPattern(value) {
   if (!value || (!value.includes('{{') && !value.includes('@{') && !value.includes('@('))) {
     return null;
@@ -283,17 +294,36 @@ export function dynamicPattern(value) {
   const first = masked.indexOf('*');
   if (first === -1) return null;
 
+  // Literal runs left over between the masked-out expressions. For
+  // "{{prefix}}-{{suffix}}" that is "-"; for "{{env}}01" it is "01". Short or
+  // punctuation-only runs are useless for matching and are dropped.
+  const segments = masked
+    .split('*')
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 2 && /[a-z0-9]/i.test(part));
+
+  // Variables the expression reads. When the backend id is built elsewhere and
+  // only referenced here, this is the thread back to where the literal lives.
+  const variableRefs = [];
+  for (const m of value.matchAll(/context\.Variables\s*\[\s*["']([^"']+)["']\s*\]/g)) {
+    variableRefs.push(m[1]);
+  }
+  for (const m of value.matchAll(/context\.Variables\s*\.\s*(?:GetValueOrDefault|TryGetValue)[^("']*\(\s*["']([^"']+)["']/g)) {
+    variableRefs.push(m[1]);
+  }
+
+  // Named values the id is assembled from, so the resolver can substitute their
+  // real values rather than giving up on "{{a}}-{{b}}".
+  const namedValueRefs = [];
+  for (const m of value.matchAll(/\{\{([^{}]+)\}\}/g)) {
+    namedValueRefs.push(m[1].trim());
+  }
+
   // The literal part of a concatenation lives inside the expression, so
   // "wem-st" in @("wem-st" + context.Variables["site"]) has to be mined out of
   // the string literals or every backend on the instance becomes a candidate.
   const hints = [];
-  for (const [start, end] of regions) {
-    const body = value.slice(start, end + 1);
-    for (const match of body.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'/g)) {
-      const literal = (match[1] ?? match[2] ?? '').trim();
-      if (literal.length >= 2 && /[a-z0-9]/i.test(literal)) hints.push(literal);
-    }
-  }
+  for (const [start, end] of regions) hints.push(...literalsIn(value.slice(start, end + 1)));
   hints.sort((a, b) => b.length - a.length);
 
   return {
@@ -301,6 +331,9 @@ export function dynamicPattern(value) {
     prefix: masked.slice(0, first),
     suffix: masked.slice(masked.lastIndexOf('*') + 1),
     hints,
+    segments,
+    variableRefs: [...new Set(variableRefs)],
+    namedValueRefs: [...new Set(namedValueRefs)],
     raw: value,
     wholeToken: /^\{\{[^{}]+\}\}$/.test(value.trim()) ? value.trim().slice(2, -2).trim() : null
   };
@@ -609,7 +642,16 @@ function extractElement(tag, node, ctx) {
         );
       }
       const baseUrl = at('base-url');
-      if (baseUrl) addTo(analysis.urls, baseUrl, occurrence, { via: 'set-backend-service base-url' });
+      if (baseUrl) {
+        // A base-url built at runtime routes just as dynamically as a
+        // backend-id does, so it is recorded as a dynamic route rather than
+        // filed away as a literal URL nobody can act on.
+        const dynamic = dynamicPattern(baseUrl);
+        addTo(analysis.urls, baseUrl, occurrence, {
+          via: 'set-backend-service base-url',
+          ...(dynamic ? { dynamic: true, ...dynamic } : {})
+        });
+      }
       break;
     }
     case 'include-fragment': {
@@ -686,7 +728,17 @@ function extractElement(tag, node, ctx) {
     }
     case 'set-variable': {
       const name = at('name');
-      if (name) addTo(analysis.variablesWritten, name, occurrence, { via: 'set-variable' });
+      if (name) {
+        // Keep the assigned expression: when a backend id is assembled into a
+        // variable and only referenced at set-backend-service, this is the only
+        // place the literal part of the name exists.
+        const assigned = at('value') ?? node.textContent?.trim() ?? null;
+        addTo(analysis.variablesWritten, name, occurrence, {
+          via: 'set-variable',
+          expression: assigned || null,
+          literals: assigned ? literalsIn(assigned) : []
+        });
+      }
       break;
     }
     case 'azure-openai-semantic-cache-lookup':

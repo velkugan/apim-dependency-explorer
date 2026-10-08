@@ -2,6 +2,7 @@ import { $, h, tokenSummary, fmtCountdown, download, copy } from './lib/util.js'
 import { ArmClient, AuthError } from './lib/arm.js';
 import { ApimService, parseServiceRef, discoverServices, API_VERSIONS, DEFAULT_API_VERSION } from './lib/apim.js';
 import { loadCatalog, resolveApi, toExport, toReport } from './lib/resolver.js';
+import { runSweep, saveSweep, loadSweep, clearSweep, sweepAge } from './lib/sweep.js';
 import {
   loadTargetIndex,
   compareApi,
@@ -10,6 +11,9 @@ import {
 } from './lib/compare.js';
 
 const SETTINGS_KEY = 'settings';
+// A fraction of ARM's 25/sec read bucket: the sweep runs under the user's own
+// identity, so spending the whole budget would throttle their portal session.
+const SWEEP_RATE = 12;
 const MANUAL_TOKEN_KEY = 'manualToken';
 const CAPTURED_KEY = 'capturedToken';
 const SEEN_KEY = 'captureSeen';
@@ -29,6 +33,9 @@ const state = {
   lastExpanded: null,
   targetService: null,
   targetIndex: null,
+  sweep: null,
+  sweeping: false,
+  cancelSweep: false,
   inFlight: new Set(),
   filter: ''
 };
@@ -57,6 +64,14 @@ const els = {
   clearCache: $('#clear-cache'),
   setupError: $('#setup-error'),
   toolbar: $('#toolbar'),
+  sweepbar: $('#sweepbar'),
+  sweepRun: $('#sweep-run'),
+  sweepOpen: $('#sweep-open'),
+  sweepStop: $('#sweep-stop'),
+  sweepAge: $('#sweep-age'),
+  sweepProgress: $('#sweep-progress'),
+  sweepFill: $('#sweep-fill'),
+  sweepDetail: $('#sweep-detail'),
   search: $('#search'),
   export: $('#export'),
   results: $('#results'),
@@ -421,6 +436,9 @@ els.clearCache.addEventListener('click', () => {
   state.catalog = null;
   state.targetIndex = null;
   state.resolved.clear();
+  state.sweep = null;
+  clearSweep();
+  renderSweepBar();
   render();
   setProgress('Cache cleared');
 });
@@ -465,6 +483,12 @@ async function fetchApis() {
     );
     els.toolbar.hidden = false;
     els.setup.hidden = true;
+
+    // A stored index for another instance is worse than none, so loadSweep
+    // discards it rather than answering with the wrong service's data.
+    state.sweep = await loadSweep(ref);
+    renderSweepBar();
+
     setProgress('');
     render();
   } catch (err) {
@@ -1037,12 +1061,12 @@ function renderResolved(r) {
       r.backends.map((b) =>
         b.dynamic
           ? item(b.id, {
-              missing: !b.exists,
-              pill: 'dynamic',
-              pillColor: 'var(--c-product)',
+              missing: b.needsReview,
+              pill: b.needsReview ? 'dynamic · review' : 'dynamic',
+              pillColor: b.needsReview ? 'var(--c-issue)' : 'var(--c-product)',
               sub: b.candidates?.length
                 ? `${b.candidates.length} possible: ${b.candidates.map((c) => c.id).join(', ')}`
-                : 'built at runtime, no matching backend found',
+                : 'could not be resolved to a backend — check this route by hand',
               why: b.resolvedVia,
               refs: b.usedIn
             })
@@ -1310,6 +1334,151 @@ function renderResolved(r) {
  * The report goes to a detached window that can lay the categories out in
  * columns. The payload rides in session storage rather than the URL.
  */
+
+// ---------------------------------------------------------------------------
+// instance sweep and reverse lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * The sweep is the one operation here that is not lazy: reverse lookup needs
+ * every API resolved. It is paced by the ARM client's token bucket, can be
+ * stopped and resumed, and persists so it survives the session.
+ */
+function renderSweepBar() {
+  const sweep = state.sweep;
+  els.sweepbar.hidden = !state.apis.length;
+  els.sweepOpen.hidden = !sweep;
+  els.sweepStop.hidden = !state.sweeping;
+  els.sweepRun.disabled = state.sweeping;
+
+  if (state.sweeping) {
+    els.sweepRun.textContent = 'Indexing…';
+  } else if (sweep && !sweep.complete) {
+    els.sweepRun.textContent = 'Resume index';
+  } else if (sweep) {
+    els.sweepRun.textContent = 'Rebuild index';
+  } else {
+    els.sweepRun.textContent = 'Build index';
+  }
+
+  if (sweep && !state.sweeping) {
+    const partial = sweep.complete ? '' : ' · partial';
+    const skipped = sweep.includeOperations ? '' : ' · no op policies';
+    els.sweepAge.textContent =
+      `${sweep.apis.length} APIs indexed ${sweepAge(sweep)}${partial}${skipped}`;
+  } else if (!state.sweeping) {
+    els.sweepAge.textContent = '';
+  }
+}
+
+function sweepProgress({ phase, message, completed, total, elapsedMs }) {
+  els.sweepProgress.hidden = false;
+  const pct = total ? Math.round((completed / total) * 100) : 0;
+  els.sweepFill.style.width = `${pct}%`;
+
+  // ARM reports the remaining read budget on every response, which is better
+  // evidence of how hard we are pushing than any local estimate.
+  const remaining = client.stats.remainingReads;
+  const budget = remaining !== null && remaining !== undefined ? ` · ${remaining} reads left` : '';
+  const rate =
+    elapsedMs > 3000
+      ? ` · ${(client.stats.requests / (elapsedMs / 1000)).toFixed(1)}/s`
+      : '';
+
+  els.sweepDetail.textContent =
+    phase === 'catalog'
+      ? `${message}…`
+      : `${completed}/${total} · ${message}${rate}${budget}`;
+  setProgress('');
+}
+
+async function startSweep() {
+  if (state.sweeping || !state.service) return;
+
+  state.sweeping = true;
+  state.cancelSweep = false;
+  renderSweepBar();
+
+  // The sweep shares the user's own ARM budget with their portal session, so
+  // it deliberately spends a fraction of the 25/sec bucket rather than all of
+  // it. Restored afterwards so interactive expands stay snappy.
+  const previousRate = client.limiter.rate;
+  client.setRate(SWEEP_RATE);
+
+  try {
+    const resume = state.sweep && !state.sweep.complete ? state.sweep : null;
+    const sweep = await runSweep({
+      svc: state.service,
+      apis: state.apis,
+      includeOperations: els.includeOperations.checked,
+      resume,
+      shouldStop: () => state.cancelSweep,
+      onProgress: sweepProgress
+    });
+
+    state.sweep = sweep;
+    await saveSweep(sweep);
+
+    if (sweep.stoppedReason === 'auth') {
+      showError(new Error(`${sweep.error} Indexed ${sweep.apis.length} APIs before stopping; press Resume after refreshing the token.`));
+    } else if (sweep.failures.length) {
+      setProgress(`Indexed ${sweep.apis.length} APIs, ${sweep.failures.length} failed`);
+    } else {
+      setProgress(`Indexed ${sweep.apis.length} APIs in ${Math.round(sweep.durationMs / 1000)}s`);
+    }
+  } catch (err) {
+    showError(err);
+  } finally {
+    client.setRate(previousRate);
+    state.sweeping = false;
+    state.cancelSweep = false;
+    els.sweepProgress.hidden = true;
+    renderSweepBar();
+    updateCounters();
+  }
+}
+
+/** Opens the report window in reverse-lookup mode. */
+async function openReverseLookup() {
+  if (!state.sweep) return;
+  const key = `report:${Date.now()}`;
+  try {
+    const existing = await chrome.storage.session.get(null);
+    const stale = Object.keys(existing).filter((k) => k.startsWith('report:'));
+    if (stale.length) await chrome.storage.session.remove(stale);
+
+    await chrome.storage.session.set({
+      [key]: {
+        service: state.service?.ref || null,
+        apiVersion: els.apiVersion.value,
+        generatedAt: new Date().toISOString(),
+        mode: 'reverse',
+        sweep: state.sweep,
+        apis: []
+      }
+    });
+    const width = Math.max(900, Math.min(1600, (screen.availWidth || 1440) - 120));
+    const height = Math.max(600, Math.min(1050, (screen.availHeight || 900) - 80));
+    await chrome.windows.create({
+      url: chrome.runtime.getURL(`src/report.html?key=${encodeURIComponent(key)}`),
+      type: 'popup',
+      width,
+      height,
+      left: 40,
+      top: 30
+    });
+  } catch (err) {
+    setProgress(`Could not open reverse lookup: ${err.message}`);
+  }
+}
+
+els.sweepRun.addEventListener('click', startSweep);
+els.sweepOpen.addEventListener('click', openReverseLookup);
+els.sweepStop.addEventListener('click', () => {
+  state.cancelSweep = true;
+  els.sweepDetail.textContent = 'Stopping after the current API…';
+});
+
 async function openReport(resolvedList, focusApiId = null) {
   if (!resolvedList.length) {
     setProgress('Expand an API first');
